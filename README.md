@@ -20,15 +20,7 @@ cd job-portal
 2. Prepare Environment
 Create a local environment file for your configuration:
 
-Bash
-# For Linux/macOS/Fedora
-touch .env
-
-# For Windows (PowerShell)
-New-Item .env
-3. Install Dependencies and Run
-Go handles module management automatically via the go.mod file.
-
-Bash
+HOW TO RUN
+Bas->
 go mod tidy
 go run .
