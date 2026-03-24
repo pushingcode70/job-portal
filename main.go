@@ -16,22 +16,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-type JobResult struct {
-	Title       string
-	CompanyName string
-	ApplyLink   string
-}
-
-type CacheEntry struct {
-	Data      []CompanyResponse `json:"data"`
-	Timestamp time.Time         `json:"timestamp"`
-}
-
 var (
-	Cache              = make(map[string]CacheEntry)
-	CacheMutex         sync.RWMutex
-	CacheFile          = "cache.json"
-
 	// Pre-Scraped Master Index
 	MasterJobList []Job
 	MasterMutex   sync.RWMutex
@@ -42,24 +27,6 @@ var (
 	FailureCounts = make(map[string]int)
 	FailureMutex  sync.Mutex
 )
-
-func loadCache() {
-	file, err := os.ReadFile(CacheFile)
-	if err == nil {
-		json.Unmarshal(file, &Cache)
-	}
-}
-
-func saveCache() {
-	CacheMutex.RLock()
-	data, err := json.Marshal(Cache)
-	CacheMutex.RUnlock()
-	if err != nil {
-		fmt.Printf("[CACHE] Error marshaling: %v\n", err)
-		return
-	}
-	os.WriteFile(CacheFile, data, 0644)
-}
 
 // loadMasterIndex loads a previously saved master index from disk
 func loadMasterIndex() {
@@ -100,63 +67,22 @@ func buildMasterIndex() {
 	fmt.Println("[MASTER] ══════════════════════════════════════════════")
 	start := time.Now()
 
-	extGH, extLV, extZH, extAS, extDB, extWD, extInd := loadTokensFromFile("tokens.json")
+	extGH, extLV, extZH, extAS, extDB, extWD := loadTokensFromFile("tokens.json")
 	allGH := append(GlobalGreenhouse, extGH...)
 	allLV := append(GlobalLever, extLV...)
 
 	// Scrape with a broad empty query to get ALL jobs
-	allJobs := scrapeJobs(allGH, allLV, extZH, extAS, extDB, extWD, extInd, "")
-
-	// Dynamic Origin Detection & Filtering
-	companyJobs := make(map[string][]Job)
-	for _, job := range allJobs {
-		companyJobs[job.Company] = append(companyJobs[job.Company], job)
-	}
-
-	var filteredJobs []Job
-	for _, jobs := range companyJobs {
-		if len(jobs) == 0 {
-			continue
-		}
-		filteredJobs = append(filteredJobs, jobs...)
-	}
+	allJobs := scrapeJobs(allGH, allLV, extZH, extAS, extDB, extWD, "")
 
 	MasterMutex.Lock()
-	MasterJobList = filteredJobs
+	MasterJobList = allJobs
 	MasterReady = true
 	MasterMutex.Unlock()
 
 	saveMasterIndex()
 	fmt.Printf("[MASTER] ✅ Index built: %d jobs from %d tokens in %s\n",
-		len(filteredJobs), len(allGH)+len(allLV)+len(extZH)+len(extAS)+len(extDB)+len(extWD),
+		len(allJobs), len(allGH)+len(allLV)+len(extZH)+len(extAS)+len(extDB)+len(extWD),
 		time.Since(start).Round(time.Millisecond))
-}
-
-func detectOrigin(company string, jobs []Job) bool {
-	// 1. Featured Global override
-	if isInList(company, GlobalGreenhouse) || isInList(company, GlobalLever) {
-		return false
-	}
-	// 2. Featured Indian override
-	if isInList(company, IndianStartups) {
-		return true
-	}
-
-	// 3. Count Indian locations
-	indiaCount := 0
-	for _, job := range jobs {
-		_, isIndia := GetLocationContext(job.Location)
-		if isIndia {
-			indiaCount++
-		}
-	}
-
-	// 4. Majority rule (>50%)
-	if len(jobs) > 0 && float64(indiaCount)/float64(len(jobs)) >= 0.5 {
-		return true
-	}
-
-	return false
 }
 
 func GetLocationContext(loc string) (string, bool) {
@@ -200,6 +126,34 @@ func GetLocationContext(loc string) (string, bool) {
 	return "Global", false
 }
 
+// expandSearchTerms returns a list of synonym terms for tech stacks
+func expandSearchTerms(query string) []string {
+	switch query {
+	case "mern":
+		return []string{"react", "node", "express", "mongodb", "fullstack", "mern", "javascript"}
+	case "golang", "go":
+		return []string{"golang", " go ", "backend", "developer", "engineer", "api", "microservice"}
+	case "javascript", "js":
+		return []string{"javascript", "typescript", "node", "react", "vue", "angular", "nextjs", "express", "frontend", "fullstack", "js"}
+	case "react", "reactjs":
+		return []string{"react", "reactjs", "nextjs", "frontend", "javascript", "typescript", "redux", "ui engineer"}
+	case "mongodb", "mongo":
+		return []string{"mongodb", "mongo", "nosql", "database", "backend", "node", "express"}
+	case "java":
+		return []string{"java", "spring", "springboot", "jvm", "backend", "microservice", "kubernetes", "kafka"}
+	case "c++", "cpp":
+		return []string{"c++", "cpp", "systems", "embedded", "graphics", "game", "performance", "low-latency", "hft"}
+	case "frontend", "front-end":
+		return []string{"frontend", "front-end", "react", "vue", "angular", "javascript", "typescript", "ui", "css", "html", "nextjs"}
+	case "backend", "back-end":
+		return []string{"backend", "back-end", "api", "node", "java", "python", "golang", "ruby", "microservice", "server", "rest", "graphql"}
+	case "engineer", "sde", "software", "developer", "dev":
+		return []string{"engineer", "sde", "software", "developer", "dev", "backend", "frontend", "fullstack", "systems", "platform", "infrastructure", "java", "python", "react", "node", "golang", "typescript", "c++", "ruby", "rust", "php", "mobile", "ios", "android", "cloud", "devops", "qa", "test", "security", "data", "ml", "ai"}
+	default:
+		return []string{query}
+	}
+}
+
 // searchMasterIndex filters the MasterJobList in-memory (instant)
 func searchMasterIndex(query string) []CompanyResponse {
 	MasterMutex.RLock()
@@ -209,32 +163,7 @@ func searchMasterIndex(query string) []CompanyResponse {
 	q := strings.ToLower(query)
 	
 	// Tech-Stack Search Expansion
-	searchTerms := []string{q}
-	switch q {
-	case "mern":
-		searchTerms = []string{"react", "node", "express", "mongodb", "fullstack", "mern", "javascript"}
-	case "golang", "go":
-		searchTerms = []string{"golang", " go ", "backend", "developer", "engineer", "api", "microservice"}
-	case "javascript", "js":
-		searchTerms = []string{"javascript", "typescript", "node", "react", "vue", "angular", "nextjs", "express", "frontend", "fullstack", "js"}
-	case "react", "reactjs":
-		searchTerms = []string{"react", "reactjs", "nextjs", "frontend", "javascript", "typescript", "redux", "ui engineer"}
-	case "mongodb", "mongo":
-		searchTerms = []string{"mongodb", "mongo", "nosql", "database", "backend", "node", "express"}
-	case "java":
-		searchTerms = []string{"java", "spring", "springboot", "jvm", "backend", "microservice", "kubernetes", "kafka"}
-	case "c++", "cpp":
-		searchTerms = []string{"c++", "cpp", "systems", "embedded", "graphics", "game", "performance", "low-latency", "hft"}
-	case "frontend", "front-end":
-		searchTerms = []string{"frontend", "front-end", "react", "vue", "angular", "javascript", "typescript", "ui", "css", "html", "nextjs"}
-	case "backend", "back-end":
-		searchTerms = []string{"backend", "back-end", "api", "node", "java", "python", "golang", "ruby", "microservice", "server", "rest", "graphql"}
-	case "engineer", "sde", "software", "developer", "dev":
-		searchTerms = []string{"engineer", "sde", "software", "developer", "dev", "backend", "frontend", "fullstack", "systems", "platform", "infrastructure", "java", "python", "react", "node", "golang", "typescript", "c++", "ruby", "rust", "php", "mobile", "ios", "android", "cloud", "devops", "qa", "test", "security", "data", "ml", "ai"}
-	default:
-		searchTerms = []string{q}
-	}
-
+	searchTerms := expandSearchTerms(q)
 
 	// Weight-based tracking
 	companyMap := make(map[string]*struct {
@@ -344,14 +273,6 @@ func searchMasterIndex(query string) []CompanyResponse {
 		fmt.Printf("[SEARCH] Query: \"%s\" | Found: %d Indian Jobs, %d Global Jobs\n", query, indiaCount, globalCount)
 	}
 
-	// Priority Sorting: Indian companies first
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].IsIndian != results[j].IsIndian {
-			return results[i].IsIndian
-		}
-		return len(results[i].Jobs) > len(results[j].Jobs)
-	})
-
 	return results
 }
 
@@ -366,9 +287,8 @@ func main() {
 			return
 		}
 	}
-	fmt.Println("[STARTUP] Loading environment and cache...")
+	fmt.Println("[STARTUP] Loading environment and master index...")
 	godotenv.Load()
-	loadCache()
 	loadMasterIndex()
 
 	fmt.Println("[STARTUP] Configuring Fiber app...")
@@ -421,58 +341,11 @@ func main() {
 			return c.JSON(results)
 		}
 
-		// Fallback: legacy live scraping if master not built yet
-		fmt.Printf("[API] Master not ready, falling back to live scrape for: %s\n", query)
-		CacheMutex.RLock()
-		if entry, ok := Cache[query]; ok && time.Since(entry.Timestamp) < 6*time.Hour {
-			CacheMutex.RUnlock()
-			return c.JSON(entry.Data)
-		}
-		CacheMutex.RUnlock()
-
-		extGH, extLV, extZH, extAS, extDB, extWD, extInd := loadTokensFromFile("tokens.json")
-		allGH := append(GlobalGreenhouse, extGH...)
-		allLV := append(GlobalLever, extLV...)
-		rawJobs := scrapeJobs(allGH, allLV, extZH, extAS, extDB, extWD, extInd, query)
-
-		// Group results by company
-		companyMap := make(map[string]*CompanyResponse)
-		for _, j := range rawJobs {
-			if _, exists := companyMap[j.Company]; !exists {
-				companyMap[j.Company] = &CompanyResponse{
-					Name:     j.Company,
-					IsIndian: false,
-					Jobs:     []Job{},
-				}
-			}
-			compRes := companyMap[j.Company]
-			compRes.Jobs = append(compRes.Jobs, j)
-			if j.IsIndia {
-				compRes.IsIndian = true
-			}
-		}
-
-		finalResponse := make([]CompanyResponse, 0)
-		for _, comp := range companyMap {
-			if len(comp.Jobs) == 0 {
-				continue
-			}
-			// Truncate jobs if more than 8
-			if len(comp.Jobs) > 8 {
-				comp.Jobs = comp.Jobs[:8]
-			}
-			finalResponse = append(finalResponse, *comp)
-		}
-
-		// Sort results: Indian companies first
-		sort.Slice(finalResponse, func(i, j int) bool {
-			if finalResponse[i].IsIndian != finalResponse[j].IsIndian {
-				return finalResponse[i].IsIndian
-			}
-			return len(finalResponse[i].Jobs) > len(finalResponse[j].Jobs)
+		// Master not ready fallback: return error instead of live scraping
+		fmt.Printf("[API] Master not ready, rejecting live scrape for: %s\n", query)
+		return c.Status(http.StatusServiceUnavailable).JSON(map[string]string{
+			"error": "System Initializing - Master Index is actively building. Please try again soon.",
 		})
-
-		return c.JSON(finalResponse)
 	})
 
 	app.Get("/api/company", func(c *fiber.Ctx) error {
@@ -481,7 +354,7 @@ func main() {
 
 		token := ""
 		isGreenhouse, isLever, isZoho, isAshby, isDarwinbox, isWorkday := false, false, false, false, false, false
-		extGH, extLV, extZH, extAS, extDB, extWD, extInd := loadTokensFromFile("tokens.json")
+		extGH, extLV, extZH, extAS, extDB, extWD := loadTokensFromFile("tokens.json")
 
 		allGH := append(GlobalGreenhouse, extGH...)
 		for _, t := range allGH {
@@ -559,29 +432,7 @@ func main() {
 		// Declare results slice
 		var results []Job
 		// Build synonym search terms (same logic as searchMasterIndex)
-		expandedTerms := []string{searchQuery}
-		switch searchQuery {
-		case "mern":
-			expandedTerms = []string{"react", "node", "express", "mongodb", "fullstack", "mern", "javascript"}
-		case "golang", "go":
-			expandedTerms = []string{"golang", " go ", "backend", "developer", "engineer", "api", "microservice"}
-		case "javascript", "js":
-			expandedTerms = []string{"javascript", "typescript", "node", "react", "vue", "angular", "nextjs", "express", "frontend", "fullstack", "js"}
-		case "react", "reactjs":
-			expandedTerms = []string{"react", "reactjs", "nextjs", "frontend", "javascript", "typescript", "redux", "ui engineer"}
-		case "mongodb", "mongo":
-			expandedTerms = []string{"mongodb", "mongo", "nosql", "database", "backend", "node", "express"}
-		case "java":
-			expandedTerms = []string{"java", "spring", "springboot", "jvm", "backend", "microservice", "kubernetes", "kafka"}
-		case "c++", "cpp":
-			expandedTerms = []string{"c++", "cpp", "systems", "embedded", "graphics", "game", "performance", "low-latency", "hft"}
-		case "frontend", "front-end":
-			expandedTerms = []string{"frontend", "front-end", "react", "vue", "angular", "javascript", "typescript", "ui", "css", "html", "nextjs"}
-		case "backend", "back-end":
-			expandedTerms = []string{"backend", "back-end", "api", "node", "java", "python", "golang", "ruby", "microservice", "server", "rest", "graphql"}
-		case "engineer", "sde", "software", "developer", "dev":
-			expandedTerms = []string{"engineer", "sde", "software", "developer", "dev", "backend", "frontend", "fullstack", "systems", "platform", "java", "python", "react", "node", "golang", "typescript", "c++", "mobile", "ios", "android", "cloud", "devops", "qa", "data", "ml", "ai"}
-		}
+		expandedTerms := expandSearchTerms(searchQuery)
 
 
 		matchesQuery := func(j Job) bool {
@@ -613,7 +464,7 @@ func main() {
 		// Strategy 2: Live scrape with EMPTY query (get all), then filter client-side
 		if len(results) == 0 {
 			fmt.Printf("[API] MasterIndex miss, falling back to live scrape for: %s\n", token)
-			rawResults := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, extInd, "")
+			rawResults := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, "")
 			for _, j := range rawResults {
 				if matchesQuery(j) {
 					results = append(results, j)
@@ -680,11 +531,11 @@ func main() {
 		}
 
 		if len(ghTokens) == 0 && len(lvTokens) == 0 && len(zhTokens) == 0 && len(asTokens) == 0 && len(dbTokens) == 0 && len(wdTokens) == 0 {
-			extGH, extLV, extZH, extAS, extDB, extWD, extInd := loadTokensFromFile("tokens.json")
+			extGH, extLV, extZH, extAS, extDB, extWD := loadTokensFromFile("tokens.json")
 			ghTokens = append(GlobalGreenhouse, extGH...)
 			lvTokens = append(GlobalLever, extLV...)
 			zhTokens, asTokens, dbTokens, wdTokens = extZH, extAS, extDB, extWD
-			results := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, extInd, query)
+			results := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, query)
 			
 			// Group by company and filter out zero-result companies
 			companyMap := make(map[string][]Job)
@@ -700,7 +551,7 @@ func main() {
 			}
 			return c.JSON(finalResults)
 		}
-		results := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, nil, query)
+		results := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, query)
 		
 		// Filter out zero-result companies (if grouped)
 		// For this specific call, results are usually already filtered by scrapeJobs
@@ -715,27 +566,7 @@ func main() {
 	}
 }
 
-func isFeatured(token string, featured []string) bool {
-	lowerToken := strings.ToLower(token)
-	for _, f := range featured {
-		if strings.EqualFold(f, lowerToken) {
-			return true
-		}
-	}
-	return false
-}
-
-func isInList(token string, list []string) bool {
-	lowerToken := strings.ToLower(token)
-	for _, f := range list {
-		if strings.EqualFold(f, lowerToken) {
-			return true
-		}
-	}
-	return false
-}
-
-func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, indianTokens []string, query string) []Job {
+func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []string, query string) []Job {
 	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 	var results []Job
 	var mu sync.Mutex
@@ -1032,26 +863,14 @@ func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, indi
 		}
 	})
 
-	// Darwinbox
-	processTokens(dbTokens, "DARWINBOX", func(token string) {
-		defer wg.Done()
-		sem <- struct{}{}
-		defer func() { <-sem }()
-		url := fmt.Sprintf("https://%s.darwinbox.in/ms/candidate/careers", token)
-		resp, err := client.Get(url)
-		if err != nil || resp.StatusCode != 200 {
-			if resp != nil { resp.Body.Close() }
-			return
-		}
-		defer resp.Body.Close()
-	})
+	// Darwinbox is currently a no-op / disabled
 
 	// Workday
 	processTokens(wdTokens, "WORKDAY", func(token string) {
 		defer wg.Done()
 		sem <- struct{}{}
 		defer func() { <-sem }()
-		wJobs := scrapeWorkdayJobs(token, query, indianTokens)
+		wJobs := scrapeWorkdayJobs(token, query)
 		mu.Lock()
 		results = append(results, wJobs...)
 		mu.Unlock()
@@ -1061,10 +880,10 @@ func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, indi
 	return results
 }
 
-func loadTokensFromFile(path string) ([]string, []string, []string, []string, []string, []string, []string) {
+func loadTokensFromFile(path string) ([]string, []string, []string, []string, []string, []string) {
 	file, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 	var data struct {
 		Greenhouse []string `json:"greenhouse"`
@@ -1073,13 +892,12 @@ func loadTokensFromFile(path string) ([]string, []string, []string, []string, []
 		Ashby      []string `json:"ashby"`
 		Darwinbox  []string `json:"darwinbox"`
 		Workday    []string `json:"workday"`
-		Indian     []string `json:"indian"`
 	}
 	json.Unmarshal(file, &data)
-	return data.Greenhouse, data.Lever, data.Zoho, data.Ashby, data.Darwinbox, data.Workday, data.Indian
+	return data.Greenhouse, data.Lever, data.Zoho, data.Ashby, data.Darwinbox, data.Workday
 }
 
-func scrapeWorkdayJobs(token string, query string, indianTokens []string) []Job {
+func scrapeWorkdayJobs(token string, query string) []Job {
 	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 	parts := strings.Split(token, "/")
 	hostPart := parts[0]
