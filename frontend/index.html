@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Company Job Search</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    animation: {
+                        'fade-in': 'fadeIn 0.5s ease-in-out',
+                    },
+                    keyframes: {
+                        fadeIn: {
+                            '0%': { opacity: '0', transform: 'translateY(10px)' },
+                            '100%': { opacity: '1', transform: 'translateY(0)' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen py-8 px-4">
+    <div class="max-w-4xl mx-auto">
+        <nav class="flex justify-between items-center py-4 mb-12">
+            <div></div>
+            <div class="flex space-x-4">
+                <a href="/signin" class="px-4 py-2 text-sm font-medium text-blue-600 bg-blue-100 rounded-lg hover:bg-blue-200 transition-colors">Sign In</a>
+                <a href="/signup" class="px-4 py-2 text-sm font-medium text-white bg-gradient-to-r from-blue-600 to-purple-600 rounded-lg shadow-md hover:shadow-lg transition">Sign Up</a>
+            </div>
+        </nav>
+
+        <div class="text-center mb-12">
+            <h1 class="text-5xl md:text-6xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent mb-4">Company Search</h1>
+            <p class="text-xl text-gray-600 max-w-2xl mx-auto">Search for companies hiring for specific job titles</p>
+        </div>
+
+        <div class="mb-12">
+            <div class="relative max-w-md mx-auto">
+                <input 
+                    type="text" 
+                    id="searchInput"
+                    placeholder="Search job titles like 'C++', 'Engineer'..."
+                    class="w-full px-6 py-4 text-lg border-2 border-gray-200 rounded-2xl focus:outline-none focus:ring-4 focus:ring-blue-500 shadow-lg transition-all bg-white/80 backdrop-blur-sm"
+                >
+            </div>
+        </div>
+
+        <div id="loading" class="text-center py-6 mt-6 hidden">
+            <div class="flex items-center justify-center gap-3">
+                <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+                <span id="loadingText" class="text-lg font-semibold text-gray-700">Fetching companies...</span>
+            </div>
+        </div>
+
+        <div id="results" class="grid grid-cols-1 md:grid-cols-2 gap-6"></div>
+        <div id="noResults" class="text-center py-20 hidden">
+            <h3 class="text-2xl font-bold text-gray-700">No Jobs Found in India</h3>
+            <p class="text-lg text-gray-500 mt-2">Try a different search term.</p>
+        </div>
+    </div>
+
+    <script>
+        const searchInput = document.getElementById('searchInput');
+        const resultsContainer = document.getElementById('results');
+        const loading = document.getElementById('loading');
+        const noResults = document.getElementById('noResults');
+        let debounceTimer;
+        let loadingInterval;
+
+        function searchCompanies(query) {
+            if (loadingInterval) clearInterval(loadingInterval);
+            
+            loading.classList.remove('hidden');
+            resultsContainer.innerHTML = '';
+            noResults.classList.add('hidden');
+
+            const texts = [
+                "Fetching companies...",
+                "Loading job listings...",
+                "Searching positions...",
+                "Finding matches...",
+                "Almost ready..."
+            ];
+            let index = 0;
+            document.getElementById('loadingText').textContent = texts[0];
+            loadingInterval = setInterval(() => {
+                index = (index + 1) % texts.length;
+                document.getElementById('loadingText').textContent = texts[index];
+            }, 2000);
+
+            fetch(`/api/companies?search=${encodeURIComponent(query)}&_=${Date.now()}`)
+                .then(res => res.json())
+                .then(companies => {
+                    loading.classList.add('hidden');
+                    if (loadingInterval) {
+                        clearInterval(loadingInterval);
+                        loadingInterval = null;
+                    }
+                    if (!companies || companies.length === 0) {
+                        noResults.classList.remove('hidden');
+                    } else {
+                        displayCompanies(companies);
+                    }
+                })
+                .catch(() => {
+                    loading.classList.add('hidden');
+                    if (loadingInterval) {
+                        clearInterval(loadingInterval);
+                        loadingInterval = null;
+                    }
+                    noResults.classList.remove('hidden');
+                });
+        }
+
+        function displayCompanies(companies) {
+            // Filter out companies with zero jobs is done in backend now!
+            
+            if (!companies || companies.length === 0) {
+                noResults.classList.remove('hidden');
+                return;
+            }
+
+            resultsContainer.innerHTML = companies.map(company => `
+                <div class="bg-white/70 backdrop-blur-sm rounded-3xl shadow-xl p-8 border border-white/50 animate-fade-in hover:shadow-2xl transition-all flex flex-col justify-between">
+                    <div>
+                        <div class="flex items-start justify-between mb-4">
+                            <div class="flex items-center gap-4">
+                                <div class="w-12 h-12 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center text-white font-bold text-xl shadow-inner">
+                                    ${company.name.charAt(0).toUpperCase()}
+                                </div>
+                                <h3 class="text-2xl font-bold text-gray-800 capitalize">
+                                    ${company.name} 
+                                    <span class="text-xs font-medium ${company.isIndian ? 'text-green-600 bg-green-50 border-green-100' : 'text-purple-600 bg-purple-50 border-purple-100'} px-2 py-1 rounded-md ml-2 border">
+                                        (${company.isIndian ? 'Indian' : 'Global'})
+                                    </span>
+                                </h3>
+                            </div>
+                        </div>
+                        
+                        <ul class="list-disc list-inside space-y-2 mb-6 text-gray-600">
+                            ${company.jobs.slice(0, 3).map(job => `
+                                <li class="text-sm truncate">${job.title}</li>
+                            `).join('')}
+                        </ul>
+                    </div>
+                    
+                    <a href="/company/${encodeURIComponent(company.name)}?search=${encodeURIComponent(searchInput.value)}" 
+                       class="text-center w-full inline-block px-8 py-4 bg-gradient-to-r from-blue-600 to-purple-600 text-white font-semibold rounded-2xl shadow-lg hover:shadow-xl transition-all">
+                        View All
+                    </a>
+                </div>
+            `).join('');
+        }
+
+        searchInput.addEventListener('input', (e) => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => searchCompanies(e.target.value.trim()), 300);
+        });
+
+        // Search on load to show featured results
+        window.addEventListener('load', () => searchCompanies(''));
+    </script>
+</body>
+</html>

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Company Jobs - Job Portal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    animation: {
+                        'fade-in': 'fadeIn 0.5s ease-in-out',
+                        'spin-slow': 'spin 1s linear infinite',
+                    },
+                    keyframes: {
+                        fadeIn: {
+                            '0%': { opacity: '0', transform: 'translateY(10px)' },
+                            '100%': { opacity: '1', transform: 'translateY(0)' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 min-h-screen py-8 px-4">
+    <div class="max-w-4xl mx-auto">
+        <div class="mb-12 flex items-center gap-4">
+            <a href="/" class="flex items-center gap-2 px-6 py-3 bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg hover:shadow-xl transition-all duration-300">
+                <svg class="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
+                </svg>
+                <span class="font-semibold text-gray-700">Back to Search</span>
+            </a>
+            <div class="flex-1 text-center">
+                <h1 id="companyName" class="text-4xl md:text-5xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent mb-2 capitalize">Loading...</h1>
+                <p id="subTitle" class="text-lg text-gray-600">All open positions</p>
+            </div>
+        </div>
+
+        <div id="loading" class="text-center py-20">
+            <div class="inline-block animate-spin-slow w-16 h-16 border-4 border-blue-200 border-t-blue-600 rounded-full mb-6"></div>
+            <h3 class="text-2xl font-bold text-gray-700">Loading jobs...</h3>
+        </div>
+
+        <div id="jobsList" class="space-y-4 hidden"></div>
+
+        <div id="noJobs" class="text-center py-20 hidden">
+            <h3 class="text-2xl font-bold text-gray-700">No jobs found</h3>
+            <p class="text-lg text-gray-500">Try a different search term or company.</p>
+        </div>
+    </div>
+
+    <script>
+        const pathParts = window.location.pathname.split('/').filter(Boolean);
+        const companyName = decodeURIComponent(pathParts[pathParts.length - 1] || 'Unknown');
+        
+        // Extract search parameter from the URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const searchQuery = urlParams.get('search') || '';
+        
+        document.getElementById('companyName').textContent = companyName;
+        if (searchQuery) {
+            document.getElementById('subTitle').textContent = `Open positions for "${searchQuery}"`;
+        } else {
+            document.getElementById('subTitle').textContent = `All open positions`;
+        }
+
+        const jobsList = document.getElementById('jobsList');
+        const loading = document.getElementById('loading');
+        const noJobs = document.getElementById('noJobs');
+
+        // Fetch with cache buster to avoid stale results
+        fetch(`/api/company?name=${encodeURIComponent(companyName)}&search=${encodeURIComponent(searchQuery)}&_=${Date.now()}`)
+            .then(res => res.json())
+            .then(data => {
+                console.log("API Result:", data);
+                loading.classList.add('hidden');
+                
+                // Handle both new {jobs: []} and old [] data structures for robustness
+                const jobs = Array.isArray(data) ? data : (data.jobs || []);
+                const isIndian = data.isIndian !== undefined ? data.isIndian : true;
+                const name = data.name || companyName;
+
+                document.getElementById('companyName').innerHTML = `
+                    <div class="flex items-center justify-center gap-4">
+                        <div class="w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-2xl flex items-center justify-center text-white font-bold text-3xl shadow-xl">
+                            ${name.charAt(0).toUpperCase()}
+                        </div>
+                        <div>
+                            ${name}
+                            <span class="text-xl font-medium ${isIndian ? 'text-green-600 bg-green-50' : 'text-purple-600 bg-purple-50'} px-3 py-1 rounded-lg ml-2 align-middle border ${isIndian ? 'border-green-100' : 'border-purple-100'}">
+                                (${isIndian ? 'Indian' : 'Global'})
+                            </span>
+                        </div>
+                    </div>
+                `;
+
+                if (!Array.isArray(jobs) || jobs.length === 0) {
+                    console.warn("No jobs found for", companyName);
+                    noJobs.classList.remove('hidden');
+                } else {
+                    jobsList.classList.remove('hidden');
+                    jobsList.innerHTML = jobs.map(job => `
+                        <div class="bg-white/70 backdrop-blur-sm rounded-2xl p-6 shadow-lg border border-white/50 animate-fade-in hover:shadow-2xl transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                            <div>
+                                <h3 class="text-xl font-bold text-gray-800">
+                                    ${job.title}
+                                    <span class="text-xs font-semibold ${job.isIndia ? 'text-green-600 bg-green-50' : 'text-gray-500 bg-gray-50'} px-2 py-1 rounded-md ml-2 border ${job.isIndia ? 'border-green-100' : 'border-gray-200'}">
+                                        ${job.locationTag}
+                                    </span>
+                                </h3>
+                                <p class="text-sm text-gray-500 mt-1">${job.location}</p>
+                            </div>
+                            <a href="${job.url}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center justify-center px-8 py-3 bg-gradient-to-r from-blue-600 to-purple-600 text-white font-semibold rounded-xl shadow-lg hover:shadow-xl transition-all whitespace-nowrap">
+                                Apply Now →
+                            </a>
+                        </div>
+                    `).join('');
+                }
+            })
+            .catch(() => {
+                loading.classList.add('hidden');
+                noJobs.classList.remove('hidden');
+            });
+    </script>
+</body>
+</html>
