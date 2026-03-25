@@ -22,5 +22,5 @@ Create a local environment file for your configuration:
 
 HOW TO RUN
 Bas->
-go mod tidy
+go mod tidy(if theres any problem change go version in go mod file to 1.25.1)
 go run .
