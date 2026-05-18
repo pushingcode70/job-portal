@@ -3,10 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,72 +17,335 @@ import (
 )
 
 var (
-	// Pre-Scraped Master Index
-	MasterJobList []Job
-	MasterMutex   sync.RWMutex
-	MasterFile    = "master_jobs.json"
-	MasterReady   = false
-
 	// Failure Tracking
 	FailureCounts = make(map[string]int)
 	FailureMutex  sync.Mutex
+
+	// RAM Cache
+	RAMCache      []CompanyResponse
+	RAMCacheMutex sync.RWMutex
+
+	// Third Party Cache
+	ThirdPartyCache      = make(map[string][]Job)
+	ThirdPartyCacheMutex sync.RWMutex
 )
 
-// loadMasterIndex loads a previously saved master index from disk
-func loadMasterIndex() {
-	file, err := os.ReadFile(MasterFile)
+func RefreshRAMCache() {
+	refreshRAMCacheFromQuery("")
+}
+
+// RefreshRAMCacheQuick loads a subset so search is responsive during cold start.
+func RefreshRAMCacheQuick() {
+	refreshRAMCacheFromQuery("LIMIT 200000")
+}
+
+func loadIndianCompanySlugs() map[string]bool {
+	indian := make(map[string]bool)
+	rows, err := DB.Query(`SELECT slug FROM companies WHERE is_indian = 1`)
 	if err != nil {
-		fmt.Println("[MASTER] No existing master_jobs.json found, will build fresh")
+		return indian
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var slug string
+		if err := rows.Scan(&slug); err == nil {
+			indian[strings.ToLower(slug)] = true
+		}
+	}
+	return indian
+}
+
+// fetchFromJooble calls the Jooble API and returns standardized Job slice
+func fetchFromJooble(query string, page int) []Job {
+	var jobs []Job
+	apiKey := os.Getenv("JOOBLE_API_KEY")
+	if apiKey == "" {
+		return jobs
+	}
+
+	url := "https://jooble.org/api/" + apiKey
+	payload := map[string]interface{}{
+		"keywords": query,
+		"location": "India",
+		"page":     fmt.Sprintf("%d", page),
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(body)))
+	if err != nil {
+		return jobs
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return jobs
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Jobs []struct {
+			Title    string `json:"title"`
+			Company  string `json:"company"`
+			Location string `json:"location"`
+			URL      string `json:"link"`
+		} `json:"jobs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return jobs
+	}
+
+	for _, j := range data.Jobs {
+		tag, isIndia := GetLocationContext(j.Location)
+		jobs = append(jobs, Job{
+			Title:       j.Title,
+			Company:     j.Company,
+			Location:    j.Location,
+			LocationTag: tag,
+			URL:         j.URL,
+			IsIndia:     isIndia,
+		})
+	}
+	return jobs
+}
+
+// fetchFromCareerjet calls the Careerjet API and returns standardized Job slice
+func fetchFromCareerjet(query string) []Job {
+	var jobs []Job
+	url := "http://public.api.careerjet.net/search?locale_code=en_IN"
+	if query != "" {
+		url += "&keywords=" + query
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return jobs
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Jobs []struct {
+			Title    string `json:"title"`
+			Company  string `json:"company"`
+			Location string `json:"locations"`
+			URL      string `json:"url"`
+		} `json:"jobs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return jobs
+	}
+
+	for _, j := range data.Jobs {
+		tag, isIndia := GetLocationContext(j.Location)
+		jobs = append(jobs, Job{
+			Title:       j.Title,
+			Company:     j.Company,
+			Location:    j.Location,
+			LocationTag: tag,
+			URL:         j.URL,
+			IsIndia:     isIndia,
+		})
+	}
+	return jobs
+}
+
+// VerifyAPIIntegrations performs a diagnostic test of the JOOBLE and SERPER APIs
+func VerifyAPIIntegrations() {
+	joobleKey := os.Getenv("JOOBLE_API_KEY")
+	serperKey := os.Getenv("SERPER_API_KEY")
+
+	if joobleKey == "" || serperKey == "" {
+		fmt.Println("================================================================================")
+		fmt.Println("  [CRITICAL WARNING] API KEYS MISSING")
+		fmt.Println("  Please ensure both JOOBLE_API_KEY and SERPER_API_KEY are present in .env")
+		fmt.Println("================================================================================")
 		return
 	}
-	var idx MasterIndex
-	if err := json.Unmarshal(file, &idx); err != nil {
-		return
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Test Serper
+	reqSerper, _ := http.NewRequest("POST", "https://google.serper.dev/search", strings.NewReader(`{"q":"test"}`))
+	reqSerper.Header.Set("X-API-KEY", serperKey)
+	reqSerper.Header.Set("Content-Type", "application/json")
+	respS, errS := client.Do(reqSerper)
+	if errS == nil && respS.StatusCode == 200 {
+		fmt.Println("[HEALTH] ✅ Serper API: Connected (Credits: Active)")
+	} else {
+		fmt.Println("[HEALTH] ❌ Serper API: Invalid Key or No Credits")
 	}
-	fmt.Printf("[DEBUG] Loading index from disk: %d jobs found. Delete master_jobs.json to force re-scrape.\n", len(idx.Jobs))
-	// Only use if less than 6 hours old
-	if time.Since(idx.Timestamp) < 6*time.Hour {
-		MasterMutex.Lock()
-		MasterJobList = idx.Jobs
-		MasterReady = true
-		MasterMutex.Unlock()
-		fmt.Printf("[MASTER] Loaded %d jobs from disk (age: %s)\n", len(idx.Jobs), time.Since(idx.Timestamp).Round(time.Minute))
+	if respS != nil {
+		respS.Body.Close()
+	}
+
+	// Test Jooble
+	urlJooble := "https://jooble.org/api/" + joobleKey
+	payloadJooble := `{"keywords": "Software", "location": "India"}`
+	reqJooble, _ := http.NewRequest("POST", urlJooble, strings.NewReader(payloadJooble))
+	reqJooble.Header.Set("Content-Type", "application/json")
+	respJ, errJ := client.Do(reqJooble)
+	if errJ == nil && respJ.StatusCode == 200 {
+		fmt.Println("[HEALTH] ✅ Jooble API: Authorized")
+	} else {
+		fmt.Println("[HEALTH] ❌ Jooble API: Unauthorized or Error")
+	}
+	if respJ != nil {
+		respJ.Body.Close()
 	}
 }
 
-// saveMasterIndex persists the master list to disk
-func saveMasterIndex() {
-	MasterMutex.RLock()
-	idx := MasterIndex{Jobs: MasterJobList, Timestamp: time.Now()}
-	MasterMutex.RUnlock()
-	data, _ := json.Marshal(idx)
-	os.WriteFile(MasterFile, data, 0644)
-	fmt.Printf("[MASTER] Saved %d jobs to %s\n", len(idx.Jobs), MasterFile)
+type scrapeTarget struct {
+	slug     string
+	platform string
 }
 
-// buildMasterIndex scrapes ALL tokens and populates MasterJobList
-func buildMasterIndex() {
-	fmt.Println("[MASTER] ══════════════════════════════════════════════")
-	fmt.Println("[MASTER]  Building Master Index — scraping all tokens")
-	fmt.Println("[MASTER] ══════════════════════════════════════════════")
-	start := time.Now()
+const syncBatchSize = 50
 
-	extGH, extLV, extZH, extAS, extDB, extWD := loadTokensFromFile("tokens.json")
-	allGH := append(GlobalGreenhouse, extGH...)
-	allLV := append(GlobalLever, extLV...)
+// syncJobsToDB scrapes verified companies with UPSERT + mark-and-sweep expiration.
+func syncJobsToDB() {
+	fmt.Println("[SYNC] ══════════════════════════════════════════════")
+	fmt.Println("[SYNC]  Persistent sync (UPSERT + mark-and-sweep)...")
+	fmt.Println("[SYNC] ══════════════════════════════════════════════")
 
-	// Scrape with a broad empty query to get ALL jobs
-	allJobs := scrapeJobs(allGH, allLV, extZH, extAS, extDB, extWD, "")
+	syncStart := time.Now()
+	syncCompleted := false
+	defer func() {
+		if syncCompleted {
+			if n, err := SweepStaleJobsAfterSync(syncStart, syncSweepGrace()); err != nil {
+				fmt.Printf("[SYNC] Sweep error: %v\n", err)
+			} else if n > 0 {
+				fmt.Printf("[SYNC] Mark-and-sweep removed %d stale jobs (grace=%s)\n", n, syncSweepGrace())
+			}
+		} else {
+			fmt.Println("[SYNC] Mark-and-sweep SKIPPED — sync did not finish (crash-safe)")
+		}
+		MaybeRefreshRAMCache(true)
+	}()
 
-	MasterMutex.Lock()
-	MasterJobList = allJobs
-	MasterReady = true
-	MasterMutex.Unlock()
+	targets := loadVerifiedScrapeTargets()
+	if len(targets) == 0 {
+		extGH, extLV, extSR, extZH, extAS, extDB, extWD := loadTokensFromFile("tokens.json")
+		for _, s := range append(GlobalGreenhouse, extGH...) {
+			targets = append(targets, scrapeTarget{slug: s, platform: "greenhouse"})
+		}
+		for _, s := range append(GlobalLever, extLV...) {
+			targets = append(targets, scrapeTarget{slug: s, platform: "lever"})
+		}
+		for _, s := range extSR {
+			targets = append(targets, scrapeTarget{slug: s, platform: "smartrecruiters"})
+		}
+		for _, s := range extAS {
+			targets = append(targets, scrapeTarget{slug: s, platform: "ashby"})
+		}
+		for _, s := range extZH {
+			targets = append(targets, scrapeTarget{slug: s, platform: "zoho"})
+		}
+		for _, s := range extDB {
+			targets = append(targets, scrapeTarget{slug: s, platform: "darwinbox"})
+		}
+		for _, s := range extWD {
+			targets = append(targets, scrapeTarget{slug: s, platform: "workday"})
+		}
+	}
 
-	saveMasterIndex()
-	fmt.Printf("[MASTER] ✅ Index built: %d jobs from %d tokens in %s\n",
-		len(allJobs), len(allGH)+len(allLV)+len(extZH)+len(extAS)+len(extDB)+len(extWD),
-		time.Since(start).Round(time.Millisecond))
+	var totalJobs int
+	uniqueCompanies := make(map[string]bool)
+
+	for i := 0; i < len(targets); i += syncBatchSize {
+		end := i + syncBatchSize
+		if end > len(targets) {
+			end = len(targets)
+		}
+		batch := targets[i:end]
+		gh, lv, sr, zh, as, db, wd := splitScrapeTargets(batch)
+		rawJobs := scrapeJobs(gh, lv, sr, zh, as, db, wd, "")
+
+		var dbJobs []JobRecord
+		now := time.Now()
+		for _, j := range rawJobs {
+			if j.URL == "" {
+				continue
+			}
+			key := strings.ToLower(j.Company)
+			uniqueCompanies[key] = true
+			dbJobs = append(dbJobs, JobRecord{
+				URL:         j.URL,
+				Title:       j.Title,
+				Company:     key,
+				Location:    j.Location,
+				LocationTag: j.LocationTag,
+				IsIndia:     j.IsIndia,
+				Timestamp:   now,
+			})
+		}
+		if err := batchUpsertJobs(dbJobs); err != nil {
+			fmt.Printf("[SYNC] Batch upsert error: %v\n", err)
+		}
+		totalJobs += len(dbJobs)
+		fmt.Printf("[SYNC] Batch %d–%d: upserted %d jobs from %d companies\n", i+1, end, len(dbJobs), len(batch))
+	}
+
+	if n, err := CleanupUnverifiedJobsWithPolicy(); err != nil {
+		fmt.Printf("[SYNC] Unverified job cleanup error: %v\n", err)
+	} else if n > 0 {
+		fmt.Printf("[SYNC] Processed %d jobs for unverified companies (quarantine=%v)\n", n, os.Getenv("SYNC_QUARANTINE") == "1")
+	}
+
+	syncCompleted = true
+	fmt.Printf("[SYNC] Complete: %d jobs upserted across %d companies.\n", totalJobs, len(uniqueCompanies))
+	
+	RefreshRAMCache()
+}
+
+func loadVerifiedScrapeTargets() []scrapeTarget {
+	rows, err := DB.Query(`
+		SELECT slug, platform FROM companies 
+		WHERE platform IN ('greenhouse','lever','smartrecruiters','ashby','zoho','darwinbox','workday')
+		ORDER BY (SELECT COUNT(*) FROM jobs WHERE company = companies.slug) ASC`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var targets []scrapeTarget
+	for rows.Next() {
+		var slug, platform string
+		if err := rows.Scan(&slug, &platform); err != nil {
+			continue
+		}
+		targets = append(targets, scrapeTarget{slug: slug, platform: platform})
+	}
+	return targets
+}
+
+func splitScrapeTargets(batch []scrapeTarget) (gh, lv, sr, zh, as, db, wd []string) {
+	for _, t := range batch {
+		switch t.platform {
+		case "greenhouse":
+			gh = append(gh, t.slug)
+		case "lever":
+			lv = append(lv, t.slug)
+		case "smartrecruiters":
+			sr = append(sr, t.slug)
+		case "zoho":
+			zh = append(zh, t.slug)
+		case "ashby":
+			as = append(as, t.slug)
+		case "darwinbox":
+			db = append(db, t.slug)
+		case "workday":
+			wd = append(wd, t.slug)
+		}
+	}
+	return
 }
 
 func GetLocationContext(loc string) (string, bool) {
@@ -126,170 +389,172 @@ func GetLocationContext(loc string) (string, bool) {
 	return "Global", false
 }
 
-// expandSearchTerms returns a list of synonym terms for tech stacks
-func expandSearchTerms(query string) []string {
-	switch query {
-	case "mern":
-		return []string{"react", "node", "express", "mongodb", "fullstack", "mern", "javascript"}
-	case "golang", "go":
-		return []string{"golang", " go ", "backend", "developer", "engineer", "api", "microservice"}
-	case "javascript", "js":
-		return []string{"javascript", "typescript", "node", "react", "vue", "angular", "nextjs", "express", "frontend", "fullstack", "js"}
-	case "react", "reactjs":
-		return []string{"react", "reactjs", "nextjs", "frontend", "javascript", "typescript", "redux", "ui engineer"}
-	case "mongodb", "mongo":
-		return []string{"mongodb", "mongo", "nosql", "database", "backend", "node", "express"}
-	case "java":
-		return []string{"java", "spring", "springboot", "jvm", "backend", "microservice", "kubernetes", "kafka"}
-	case "c++", "cpp":
-		return []string{"c++", "cpp", "systems", "embedded", "graphics", "game", "performance", "low-latency", "hft"}
-	case "frontend", "front-end":
-		return []string{"frontend", "front-end", "react", "vue", "angular", "javascript", "typescript", "ui", "css", "html", "nextjs"}
-	case "backend", "back-end":
-		return []string{"backend", "back-end", "api", "node", "java", "python", "golang", "ruby", "microservice", "server", "rest", "graphql"}
-	case "engineer", "sde", "software", "developer", "dev":
-		return []string{"engineer", "sde", "software", "developer", "dev", "backend", "frontend", "fullstack", "systems", "platform", "infrastructure", "java", "python", "react", "node", "golang", "typescript", "c++", "ruby", "rust", "php", "mobile", "ios", "android", "cloud", "devops", "qa", "test", "security", "data", "ml", "ai"}
-	default:
-		return []string{query}
-	}
-}
-
-// searchMasterIndex filters the MasterJobList in-memory (instant)
 func searchMasterIndex(query string) []CompanyResponse {
-	MasterMutex.RLock()
-	jobs := MasterJobList
-	MasterMutex.RUnlock()
-
 	q := strings.ToLower(query)
-	
-	// Tech-Stack Search Expansion
-	searchTerms := expandSearchTerms(q)
-
-	// Weight-based tracking
-	companyMap := make(map[string]*struct {
-		Response *CompanyResponse
-		Score    int
-	})
-	var indiaCount, globalCount int
-
-	for _, job := range jobs {
-		lowerTitle := strings.ToLower(job.Title)
-		lowerCompany := strings.ToLower(job.Company)
-		score := 0
-
-		// Weight-Based Matching
-		if q == "" {
-			score = 1
-		} else {
-			// Exact match (10 points)
-			if strings.Contains(lowerTitle, q) || strings.Contains(lowerCompany, q) {
-				score = 10
-			} else {
-				// Synonym match (5 points)
-				for _, term := range searchTerms {
-					if strings.Contains(lowerTitle, term) || strings.Contains(lowerCompany, term) {
-						score = 5
-						break
-					}
-				}
-			}
-		}
-
-		if score > 0 {
-			if _, exists := companyMap[job.Company]; !exists {
-				companyMap[job.Company] = &struct {
-					Response *CompanyResponse
-					Score    int
-				}{
-					Response: &CompanyResponse{
-						Name:     job.Company,
-						IsIndian: false,
-						Jobs:     []Job{},
-					},
-					Score: score,
-				}
-			}
-			data := companyMap[job.Company]
-			data.Response.Jobs = append(data.Response.Jobs, job)
-			
-			// Update company-level score if higher
-			if score > data.Score {
-				data.Score = score
-			}
-
-			if job.IsIndia {
-				data.Response.IsIndian = true
-			}
-		}
-	}
-
-	// Final pass to build and sort results
-	type scoredCompany struct {
-		Response CompanyResponse
-		Score    int
-	}
-	var scoredList []scoredCompany
-
-	for _, data := range companyMap {
-		comp := data.Response
-		if comp.IsIndian {
-			indiaCount += len(comp.Jobs)
-		} else {
-			globalCount += len(comp.Jobs)
-		}
-		
-		// Internal Job Sorting: India-based positions first
-		sort.Slice(comp.Jobs, func(i, j int) bool {
-			if comp.Jobs[i].IsIndia != comp.Jobs[j].IsIndia {
-				return comp.Jobs[i].IsIndia // True (India) comes first
-			}
-			return false
-		})
-
-		// Truncate to top 8 (though frontend only shows 3)
-		if len(comp.Jobs) > 8 {
-			comp.Jobs = comp.Jobs[:8]
-		}
-		scoredList = append(scoredList, scoredCompany{Response: *comp, Score: data.Score})
-	}
-
-	// Global Sorting: IsIndian > Match Score > Job Count
-	sort.Slice(scoredList, func(i, j int) bool {
-		if scoredList[i].Response.IsIndian != scoredList[j].Response.IsIndian {
-			return scoredList[i].Response.IsIndian
-		}
-		if scoredList[i].Score != scoredList[j].Score {
-			return scoredList[i].Score > scoredList[j].Score
-		}
-		return len(scoredList[i].Response.Jobs) > len(scoredList[j].Response.Jobs)
-	})
-
 	var results []CompanyResponse
-	for _, sc := range scoredList {
-		results = append(results, sc.Response)
+	start := time.Now()
+
+	RAMCacheMutex.RLock()
+	cache := RAMCache
+	RAMCacheMutex.RUnlock()
+
+	if len(cache) == 0 {
+		fmt.Printf("[PERF] RAM cache cold (%dms) — warm cache for instant search.\n", time.Since(start).Milliseconds())
+		return nil
 	}
 
-	if q != "" {
-		fmt.Printf("[SEARCH] Query: \"%s\" | Found: %d Indian Jobs, %d Global Jobs\n", query, indiaCount, globalCount)
+	if q == "" {
+		if len(cache) > 1000 {
+			results = append(results, cache[:1000]...)
+		} else {
+			results = append(results, cache...)
+		}
+		return results
 	}
+
+	for _, cr := range cache {
+		var matchedJobs []Job
+		for _, j := range cr.Jobs {
+			if jobMatchesRoleQuery(j.Title, j.Company, q) {
+				matchedJobs = append(matchedJobs, j)
+			}
+		}
+
+		if len(matchedJobs) > 0 {
+			crCopy := cr
+			crCopy.Jobs = matchedJobs
+			results = append(results, crCopy)
+		}
+	}
+
+	sortCompaniesByJobCount(results)
+
+	const maxCompanies = 1000
+	if len(results) > maxCompanies {
+		results = results[:maxCompanies]
+	}
+
+	fmt.Printf("[PERF] RAM Cache Search: %dms | Found %d companies.\n", time.Since(start).Milliseconds(), len(results))
 
 	return results
 }
 
+// searchIndiaJobsFromRAM filters India roles exclusively from RAM cache.
+func searchIndiaJobsFromRAM(query string) []Job {
+	q := strings.ToLower(strings.TrimSpace(query))
+	var out []Job
+
+	RAMCacheMutex.RLock()
+	defer RAMCacheMutex.RUnlock()
+
+	for _, cr := range RAMCache {
+		for _, j := range cr.Jobs {
+			if !j.IsIndia {
+				continue
+			}
+			if q == "" || jobMatchesRoleQuery(j.Title, j.Company, q) {
+				out = append(out, j)
+			}
+		}
+	}
+	if len(out) > 1000 {
+		out = out[:1000]
+	}
+	return out
+}
+
+func asyncEnrich(query string) {
+	if query == "" { return }
+	
+	ThirdPartyCacheMutex.RLock()
+	_, exists := ThirdPartyCache[query]
+	ThirdPartyCacheMutex.RUnlock()
+	if exists { return }
+
+	var wg sync.WaitGroup
+	var joobleJobs []Job
+	var careerjetJobs []Job
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		joobleJobs = fetchFromJooble(query, 1)
+	}()
+	go func() {
+		defer wg.Done()
+		careerjetJobs = fetchFromCareerjet(query)
+	}()
+	wg.Wait()
+
+	ThirdPartyCacheMutex.Lock()
+	ThirdPartyCache[query] = append(joobleJobs, careerjetJobs...)
+	ThirdPartyCacheMutex.Unlock()
+}
+
 func main() {
+	godotenv.Load()
+	InitDB()
+
 	if len(os.Args) > 1 {
 		if os.Args[1] == "--sync" {
-			RunSync()
+			deepHunt := false
+			if len(os.Args) > 2 && os.Args[2] == "--deep-hunt" {
+				deepHunt = true
+			}
+			RunSync(deepHunt)
+			return
+		}
+		if os.Args[1] == "--ingest-seeds" {
+			deepHunt := false
+			if len(os.Args) > 2 && os.Args[2] == "--deep-hunt" {
+				deepHunt = true
+			}
+			IngestAllSeeds(deepHunt)
 			return
 		}
 		if os.Args[1] == "--build-index" {
-			buildMasterIndex()
+			syncJobsToDB()
+			return
+		}
+		if os.Args[1] == "--reset-smartrecruiters" {
+			n, err := ResetSmartRecruitersToPending()
+			if err != nil {
+				fmt.Printf("[MIGRATE] Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("[MIGRATE] Reset %d companies from smartrecruiters -> pending\n", n)
+			return
+		}
+		if os.Args[1] == "--cleanup-invalid-jobs" {
+			n, err := CleanupJobsForInvalidCompanies()
+			if err != nil {
+				fmt.Printf("[MIGRATE] Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("[MIGRATE] Removed %d jobs tied to invalid companies\n", n)
+			return
+		}
+		if os.Args[1] == "--maintenance" {
+			runDiscoveryMaintenance(true, true)
+			return
+		}
+		if os.Args[1] == "--reset-data" {
+			if err := runResetData(); err != nil {
+				fmt.Printf("[RESET] Error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+		if os.Args[1] == "--process-pending" {
+			runProcessPendingCLI()
 			return
 		}
 	}
-	fmt.Println("[STARTUP] Loading environment and master index...")
-	godotenv.Load()
-	loadMasterIndex()
+	fmt.Println("[STARTUP] Loading environment...")
+	if os.Getenv("RUN_DISCOVERY_MAINTENANCE") == "1" {
+		go runDiscoveryMaintenance(true, true)
+	}
+	VerifyAPIIntegrations()
 
 	fmt.Println("[STARTUP] Configuring Fiber app...")
 	app := fiber.New(fiber.Config{
@@ -297,180 +562,118 @@ func main() {
 	})
 	app.Use(logger.New())
 
-	fmt.Println("[STARTUP] Starting background master indexer...")
-	// Build master index immediately on startup (in background)
+	fmt.Println("[STARTUP] Warming search index in background...")
 	go func() {
-		if !MasterReady {
-			fmt.Println("[INDEXER] Master not ready, starting build...")
-			buildMasterIndex()
-		}
-		// Then refresh every 6 hours
-		ticker := time.NewTicker(6 * time.Hour)
+		RefreshRAMCacheQuick()
+		RefreshRAMCache()
+	}()
+
+	fmt.Println("[STARTUP] Starting background workers...")
+	startStatsLogger()
+	if os.Getenv("HUNTER_TURBO") == "1" || os.Getenv("HUNTER_TURBO") == "true" {
+		applyTurboHunterDefaults()
+	}
+	go backgroundHunter()
+	
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
-			fmt.Println("[INDEXER] 6-hour refresh triggered...")
-			buildMasterIndex()
+			fmt.Println("[INDEXER] 1-hour refresh triggered...")
+			syncJobsToDB()
 		}
 	}()
 
 	app.Get("/health", func(c *fiber.Ctx) error {
-		MasterMutex.RLock()
-		count := len(MasterJobList)
-		ready := MasterReady
-		MasterMutex.RUnlock()
+		var jobCount int
+		DB.QueryRow("SELECT count(*) FROM jobs").Scan(&jobCount)
 		return c.JSON(map[string]interface{}{
 			"status":      "healthy",
-			"masterJobs":  count,
-			"masterReady": ready,
+			"masterJobs":  jobCount,
 			"globalGH":    len(GlobalGreenhouse),
 			"globalLV":    len(GlobalLever),
 		})
 	})
 
 	app.Get("/api/companies", func(c *fiber.Ctx) error {
-		query := strings.ToLower(c.Query("search", ""))
+		query := strings.ToLower(strings.TrimSpace(c.Query("search", "")))
 
-		// If master index is ready, use it for INSTANT results
-		MasterMutex.RLock()
-		ready := MasterReady
-		MasterMutex.RUnlock()
-
-		if ready {
-			fmt.Printf("[API] Instant search from MasterIndex for: %s\n", query)
-			results := searchMasterIndex(query)
-			return c.JSON(results)
+		fmt.Printf("[API] Searching RAM Cache for: %s\n", query)
+		results := searchMasterIndex(query)
+		
+		if len(results) == 0 && len(query) > 2 {
+			fmt.Printf("[API] 0 local results for '%s'. Running synchronous Serper hunt...\n", query)
+			TriggerRuntimeDiscovery(query)
+			results = searchMasterIndex(query)
+		} else if len(query) > 2 {
+			go TriggerRuntimeDiscovery(query)
 		}
-
-		// Master not ready fallback: return error instead of live scraping
-		fmt.Printf("[API] Master not ready, rejecting live scrape for: %s\n", query)
-		return c.Status(http.StatusServiceUnavailable).JSON(map[string]string{
-			"error": "System Initializing - Master Index is actively building. Please try again soon.",
-		})
+		
+		go asyncEnrich(query)
+		
+		ThirdPartyCacheMutex.RLock()
+		tpJobs, exists := ThirdPartyCache[query]
+		ThirdPartyCacheMutex.RUnlock()
+		if exists && len(tpJobs) > 0 {
+			results = append(results, CompanyResponse{
+				Name: "Global Partner Networks",
+				IsIndian: true,
+				Jobs: tpJobs,
+			})
+		}
+		
+		return c.JSON(results)
 	})
 
 	app.Get("/api/company", func(c *fiber.Ctx) error {
-		name := strings.ToLower(c.Query("name", ""))
-		searchQuery := strings.ToLower(c.Query("search", ""))
+		name := strings.ToLower(strings.TrimSpace(c.Query("name", "")))
+		searchQuery := strings.ToLower(strings.TrimSpace(c.Query("search", "")))
 
-		token := ""
-		isGreenhouse, isLever, isZoho, isAshby, isDarwinbox, isWorkday := false, false, false, false, false, false
-		extGH, extLV, extZH, extAS, extDB, extWD := loadTokensFromFile("tokens.json")
-
-		allGH := append(GlobalGreenhouse, extGH...)
-		for _, t := range allGH {
-			if strings.Contains(strings.ToLower(t), name) {
-				token = t
-				isGreenhouse = true
-				break
-			}
-		}
-		if token == "" {
-			allLV := append(GlobalLever, extLV...)
-			for _, t := range allLV {
-				if strings.Contains(strings.ToLower(t), name) {
-					token = t
-					isLever = true
-					break
-				}
-			}
-		}
-		if token == "" {
-			for _, t := range extZH {
-				if strings.Contains(strings.ToLower(t), name) {
-					token = t
-					isZoho = true
-					break
-				}
-			}
-		}
-		if token == "" {
-			for _, t := range extAS {
-				if strings.Contains(strings.ToLower(t), name) {
-					token = t
-					isAshby = true
-					break
-				}
-			}
-		}
-		if token == "" {
-			for _, t := range extDB {
-				if strings.Contains(strings.ToLower(t), name) {
-					token = t
-					isDarwinbox = true
-					break
-				}
-			}
-		}
-		if token == "" {
-			for _, t := range extWD {
-				if strings.Contains(strings.ToLower(t), name) {
-					token = t
-					isWorkday = true
-					break
-				}
-			}
-		}
-
-		if token == "" {
+		if name == "" {
 			return c.Status(404).JSON(map[string]string{"error": "Company not found"})
 		}
 
-		var ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []string
-		if isGreenhouse {
-			ghTokens = []string{token}
-		} else if isLever {
-			lvTokens = []string{token}
-		} else if isZoho {
-			zhTokens = []string{token}
-		} else if isAshby {
-			asTokens = []string{token}
-		} else if isDarwinbox {
-			dbTokens = []string{token}
-		} else if isWorkday {
-			wdTokens = []string{token}
+		token := name
+		if searchQuery == token {
+			searchQuery = "" // Clear search if identical to company name
 		}
-		// Declare results slice
+
+		// Fetch directly from RAM Cache
 		var results []Job
-		// Build synonym search terms (same logic as searchMasterIndex)
-		expandedTerms := expandSearchTerms(searchQuery)
-
-
 		matchesQuery := func(j Job) bool {
 			if searchQuery == "" {
 				return true
 			}
-			lowerTitle := strings.ToLower(j.Title)
-			for _, term := range expandedTerms {
-				if strings.Contains(lowerTitle, term) {
-					return true
-				}
-			}
-			return false
+			return jobMatchesRoleQuery(j.Title, j.Company, searchQuery)
 		}
 
-		// Strategy 1: Check Master Index first (instant, synonym-aware)
-		fmt.Printf("[API] Checking MasterIndex for %s (query: %s)...\n", token, searchQuery)
-		MasterMutex.RLock()
-		for _, j := range MasterJobList {
-			if strings.EqualFold(j.Company, token) || strings.EqualFold(j.Company, strings.Title(token)) {
-				if matchesQuery(j) {
-					results = append(results, j)
-				}
+		fmt.Printf("[API] Checking RAM for %s (query: %s)...\n", token, searchQuery)
+		
+		RAMCacheMutex.RLock()
+		var companyJobs []Job
+		for _, cr := range RAMCache {
+			if strings.ToLower(cr.Name) == token || strings.ToLower(strings.ReplaceAll(cr.Name, " ", "-")) == token {
+				companyJobs = cr.Jobs
+				break
 			}
 		}
-		MasterMutex.RUnlock()
-		fmt.Printf("[API] MasterIndex found %d jobs for %s\n", len(results), token)
+		RAMCacheMutex.RUnlock()
+		
+		for _, j := range companyJobs {
+			if matchesQuery(j) {
+				results = append(results, j)
+			}
+		}
 
-		// Strategy 2: Live scrape with EMPTY query (get all), then filter client-side
+		fmt.Printf("[API] RAM found %d jobs for %s\n", len(results), token)
+
 		if len(results) == 0 {
-			fmt.Printf("[API] MasterIndex miss, falling back to live scrape for: %s\n", token)
-			rawResults := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, "")
-			for _, j := range rawResults {
-				if matchesQuery(j) {
-					results = append(results, j)
-				}
+			// fallback check to make sure it exists
+			var count int
+			DB.QueryRow("SELECT count(*) FROM companies WHERE slug = LOWER(?)", token).Scan(&count)
+			if count == 0 {
+				return c.Status(404).JSON(map[string]string{"error": "Company not found"})
 			}
-			fmt.Printf("[API] Live scrape found %d matching jobs for %s\n", len(results), token)
 		}
 
 		// Dynamic DetectOrigin for specific company view
@@ -489,92 +692,113 @@ func main() {
 		})
 	})
 
-	app.Get("/company/:name", func(c *fiber.Ctx) error {
+	// SPA fallback for Next static export (company pages, client routing)
+	app.Get("/company/*", func(c *fiber.Ctx) error {
+		if _, err := os.Stat("./frontend/company.html"); err == nil {
+			return c.SendFile("./frontend/company.html")
+		}
 		return c.SendFile("./frontend/details.html")
 	})
 
-	app.Static("/", "./frontend")
-
+	// Cache-Control middleware to prevent aggressive browser/CDNs caching of static assets
 	app.Use(func(c *fiber.Ctx) error {
-		if strings.HasPrefix(c.Path(), "/company") {
-			return c.SendFile("./frontend/details.html")
+		path := c.Path()
+		if !strings.HasPrefix(path, "/api") && !strings.HasPrefix(path, "/health") {
+			c.Set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
+			c.Set("Pragma", "no-cache")
+			c.Set("Expires", "0")
 		}
 		return c.Next()
 	})
 
-	app.Get("/api/india-jobs", func(c *fiber.Ctx) error {
-		query := strings.ToLower(c.Query("query", ""))
-		ghTokensStr := c.Query("ghTokens", "")
-		lvTokensStr := c.Query("lvTokens", "")
-		zhTokensStr := c.Query("zhTokens", "")
-		asTokensStr := c.Query("asTokens", "")
-		dbTokensStr := c.Query("dbTokens", "")
-		wdTokensStr := c.Query("wdTokens", "")
-		var ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []string
-		if ghTokensStr != "" {
-			ghTokens = strings.Split(ghTokensStr, ",")
-		}
-		if lvTokensStr != "" {
-			lvTokens = strings.Split(lvTokensStr, ",")
-		}
-		if zhTokensStr != "" {
-			zhTokens = strings.Split(zhTokensStr, ",")
-		}
-		if asTokensStr != "" {
-			asTokens = strings.Split(asTokensStr, ",")
-		}
-		if dbTokensStr != "" {
-			dbTokens = strings.Split(dbTokensStr, ",")
-		}
-		if wdTokensStr != "" {
-			wdTokens = strings.Split(wdTokensStr, ",")
-		}
-
-		if len(ghTokens) == 0 && len(lvTokens) == 0 && len(zhTokens) == 0 && len(asTokens) == 0 && len(dbTokens) == 0 && len(wdTokens) == 0 {
-			extGH, extLV, extZH, extAS, extDB, extWD := loadTokensFromFile("tokens.json")
-			ghTokens = append(GlobalGreenhouse, extGH...)
-			lvTokens = append(GlobalLever, extLV...)
-			zhTokens, asTokens, dbTokens, wdTokens = extZH, extAS, extDB, extWD
-			results := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, query)
-			
-			// Group by company and filter out zero-result companies
-			companyMap := make(map[string][]Job)
-			for _, j := range results {
-				companyMap[j.Company] = append(companyMap[j.Company], j)
-			}
-			
-			var finalResults []Job
-			for _, jobs := range companyMap {
-				if len(jobs) > 0 {
-					finalResults = append(finalResults, jobs...)
-				}
-			}
-			return c.JSON(finalResults)
-		}
-		results := scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens, query)
-		
-		// Filter out zero-result companies (if grouped)
-		// For this specific call, results are usually already filtered by scrapeJobs
-		return c.JSON(results)
+	app.Static("/", "./frontend", fiber.Static{
+		Index:  "index.html",
+		Browse: false,
 	})
 
-	fmt.Println("[STARTUP] Starting Fiber server on :3000...")
-	if err := app.Listen(":3000"); err != nil {
+	app.Use(func(c *fiber.Ctx) error {
+		path := c.Path()
+		if strings.HasPrefix(path, "/api") || strings.HasPrefix(path, "/health") {
+			return c.Next()
+		}
+		if strings.Contains(path, ".") {
+			return c.Next()
+		}
+		if strings.HasPrefix(path, "/company") {
+			if _, err := os.Stat("./frontend/company.html"); err == nil {
+				return c.SendFile("./frontend/company.html")
+			}
+			return c.SendFile("./frontend/details.html")
+		}
+		return c.SendFile("./frontend/index.html")
+	})
+
+	app.Get("/api/serper-stats", func(c *fiber.Ctx) error {
+		SerperStatsMu.Lock()
+		defer SerperStatsMu.Unlock()
+		
+		queries := make(map[string]map[string]interface{})
+		for q, compCount := range SerperQueryCompanyCounts {
+			jobCount := SerperQueryJobCounts[q]
+			queries[q] = map[string]interface{}{
+				"companies": compCount,
+				"jobs":      jobCount,
+			}
+		}
+		
+		return c.JSON(map[string]interface{}{
+			"total_companies": SerperDiscoveredCompaniesCount,
+			"total_jobs":      SerperDiscoveredJobsCount,
+			"queries":          queries,
+		})
+	})
+
+	app.Get("/api/india-jobs", func(c *fiber.Ctx) error {
+		query := strings.ToLower(c.Query("query", ""))
+
+		fmt.Printf("[API] Searching RAM Cache (India only) for: %s\n", query)
+		finalResults := searchIndiaJobsFromRAM(query)
+
+		go asyncEnrich(query)
+		
+		ThirdPartyCacheMutex.RLock()
+		tpJobs, exists := ThirdPartyCache[query]
+		ThirdPartyCacheMutex.RUnlock()
+		if exists && len(tpJobs) > 0 {
+			for _, j := range tpJobs {
+				if j.IsIndia {
+					finalResults = append(finalResults, j)
+				}
+			}
+		}
+		
+		// Limit results to avoid massive payload
+		if len(finalResults) > 1000 {
+			finalResults = finalResults[:1000]
+		}
+		
+		return c.JSON(finalResults)
+	})
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+	fmt.Printf("[STARTUP] Starting Fiber server on :%s...\n", port)
+	if err := app.Listen(":" + port); err != nil {
 		fmt.Printf("[CRITICAL] Failed to start server: %v\n", err)
-		fmt.Println("[CRITICAL] Port 3000 likely in use. Kill with: taskkill /f /im go.exe")
+		fmt.Println("[CRITICAL] Port likely in use.")
 		os.Exit(1)
 	}
 }
 
-func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []string, query string) []Job {
-	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+func scrapeJobs(ghTokens, lvTokens, srTokens, zhTokens, asTokens, dbTokens, wdTokens []string, query string) []Job {
 	var results []Job
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	client := &http.Client{Timeout: 12 * time.Second}
 
-	// 15 workers pool
-	sem := make(chan struct{}, 15)
+	// 50 workers pool
+	sem := make(chan struct{}, 50)
 
 	processTokens := func(tokens []string, platform string, fetcher func(string)) {
 		for _, t := range tokens {
@@ -611,10 +835,7 @@ func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []str
 		defer func() { <-sem }()
 
 		url := fmt.Sprintf("https://boards-api.greenhouse.io/v1/boards/%s/jobs", token)
-		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("User-Agent", userAgent)
-
-		resp, err := client.Do(req)
+		resp, err := scraperGET(url)
 		if err != nil || resp.StatusCode != 200 {
 			if resp != nil {
 				resp.Body.Close()
@@ -678,10 +899,7 @@ func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []str
 		defer func() { <-sem }()
 
 		url := fmt.Sprintf("https://api.lever.co/v0/postings/%s", token)
-		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("User-Agent", userAgent)
-
-		resp, err := client.Do(req)
+		resp, err := scraperGET(url)
 		if err != nil || resp.StatusCode != 200 {
 			if resp != nil {
 				resp.Body.Close()
@@ -733,6 +951,74 @@ func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []str
 		}
 	})
 
+	// SmartRecruiters
+	processTokens(srTokens, "SMARTRECRUITERS", func(token string) {
+		defer wg.Done()
+		sem <- struct{}{}
+		defer func() { <-sem }()
+
+		url := fmt.Sprintf("https://api.smartrecruiters.com/v1/companies/%s/postings", token)
+		resp, err := scraperGET(url)
+		if err != nil || resp.StatusCode != 200 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			trackFailure(token)
+			return
+		}
+		defer resp.Body.Close()
+
+		var data struct {
+			Content []struct {
+				Name     string `json:"name"`
+				Location struct {
+					City    string `json:"city"`
+					Country string `json:"country"`
+				} `json:"location"`
+				UUID string `json:"uuid"`
+			} `json:"content"`
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+		if err != nil || !verifySmartRecruitersBody(body) {
+			trackFailure(token)
+			return
+		}
+		if err := json.Unmarshal(body, &data); err != nil {
+			trackFailure(token)
+			return
+		}
+
+		resetFailure(token)
+		lowerQuery := strings.ToLower(query)
+		count := 0
+		indiaCount := 0
+		for _, j := range data.Content {
+			if query != "" && !strings.Contains(strings.ToLower(j.Name), lowerQuery) {
+				continue
+			}
+
+			locStr := j.Location.City + ", " + j.Location.Country
+			tag, isIndia := GetLocationContext(locStr)
+			if isIndia {
+				indiaCount++
+			}
+			count++
+			mu.Lock()
+			results = append(results, Job{
+				Title:       j.Name,
+				Company:     strings.Title(token),
+				Location:    locStr,
+				LocationTag: tag,
+				URL:         fmt.Sprintf("https://jobs.smartrecruiters.com/%s/%s", token, j.UUID),
+				IsIndia:     isIndia,
+			})
+			mu.Unlock()
+		}
+		if count > 0 {
+			fmt.Printf("[SCRAPE] Scraping %s (SmartRecruiters)... Found %d jobs. %d tagged as India.\n", strings.Title(token), count, indiaCount)
+		}
+	})
+
 	// Zoho
 	processTokens(zhTokens, "ZOHO", func(token string) {
 		defer wg.Done()
@@ -740,10 +1026,7 @@ func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []str
 		defer func() { <-sem }()
 
 		url := fmt.Sprintf("https://recruit.zoho.in/recruit/v2/public/Job_Openings?digest=%s", token)
-		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("User-Agent", userAgent)
-
-		resp, err := client.Do(req)
+		resp, err := scraperGET(url)
 		if err != nil || resp.StatusCode != 200 {
 			if resp != nil {
 				resp.Body.Close()
@@ -805,10 +1088,7 @@ func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []str
 		defer func() { <-sem }()
 
 		url := fmt.Sprintf("https://api.ashbyhq.com/v1/jobBoard/%s/jobs", token)
-		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("User-Agent", userAgent)
-
-		resp, err := client.Do(req)
+		resp, err := scraperGET(url)
 		if err != nil || resp.StatusCode != 200 {
 			if resp != nil {
 				resp.Body.Close()
@@ -880,21 +1160,22 @@ func scrapeJobs(ghTokens, lvTokens, zhTokens, asTokens, dbTokens, wdTokens []str
 	return results
 }
 
-func loadTokensFromFile(path string) ([]string, []string, []string, []string, []string, []string) {
+func loadTokensFromFile(path string) ([]string, []string, []string, []string, []string, []string, []string) {
 	file, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil, nil
 	}
 	var data struct {
-		Greenhouse []string `json:"greenhouse"`
-		Lever      []string `json:"lever"`
-		Zoho       []string `json:"zoho"`
-		Ashby      []string `json:"ashby"`
-		Darwinbox  []string `json:"darwinbox"`
-		Workday    []string `json:"workday"`
+		Greenhouse      []string `json:"greenhouse"`
+		Lever           []string `json:"lever"`
+		SmartRecruiters []string `json:"smartrecruiters"`
+		Zoho            []string `json:"zoho"`
+		Ashby           []string `json:"ashby"`
+		Darwinbox       []string `json:"darwinbox"`
+		Workday         []string `json:"workday"`
 	}
 	json.Unmarshal(file, &data)
-	return data.Greenhouse, data.Lever, data.Zoho, data.Ashby, data.Darwinbox, data.Workday
+	return data.Greenhouse, data.Lever, data.SmartRecruiters, data.Zoho, data.Ashby, data.Darwinbox, data.Workday
 }
 
 func scrapeWorkdayJobs(token string, query string) []Job {

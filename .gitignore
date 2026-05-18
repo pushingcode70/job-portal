@@ -1,0 +1,38 @@
+# Environment variables
+.env
+
+# SQLite Databases
+*.db
+*.db-shm
+*.db-wal
+
+# Build outputs / binaries
+job-portal
+portal
+testgo
+*.exe
+
+# Large outputs / logs
+ingest_output.txt
+csv_data/
+scratch/
+
+# Node.js
+node_modules/
+.npm/
+
+# Next.js
+.next/
+job-portal-redesign(2)/.next/
+job-portal-redesign(2)/node_modules/
+job-portal-redesign(2)/out/
+master_jobs.json
+tokens.json
+# Large datasets
+seeds/companies_sorted.csv
+
+# frontend next build
+frontend/_next/
+
+# duplicate redesign folder
+job-portal-redesign(2)/
