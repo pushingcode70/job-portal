@@ -35,4 +35,4 @@ seeds/companies_sorted.csv
 frontend/_next/
 
 # duplicate redesign folder
-job-portal-redesign(2)/
+job-portal-redesign(2)/*.csv
