@@ -102,7 +102,7 @@ func TestSearchMasterIndex(t *testing.T) {
 		},
 	}
 
-	pyResults := searchMasterIndex("python")
+	pyResults := searchMasterIndex("python", false, false, false)
 	if len(pyResults) != 1 || len(pyResults[0].Jobs) != 1 {
 		t.Fatalf("python search: want 1 job, got %+v", pyResults)
 	}
@@ -110,7 +110,7 @@ func TestSearchMasterIndex(t *testing.T) {
 		t.Fatalf("wrong job matched: %s", pyResults[0].Jobs[0].Title)
 	}
 
-	cppResults := searchMasterIndex("c++")
+	cppResults := searchMasterIndex("c++", false, false, false)
 	if len(cppResults) != 1 || cppResults[0].Name != "CppInc" {
 		t.Fatalf("c++ search: got %+v", cppResults)
 	}
@@ -140,7 +140,7 @@ func TestSearchRAMCachePythonRole(t *testing.T) {
 		},
 	}
 
-	results := searchMasterIndex("python")
+	results := searchMasterIndex("python", false, false, false)
 	if len(results) != 2 {
 		t.Fatalf("want 2 companies, got %d", len(results))
 	}
@@ -167,7 +167,7 @@ func TestSearchRankingIndianFirst(t *testing.T) {
 		}},
 		{Name: "IndiaCo", IsIndian: true, Jobs: []Job{{Title: "Python Intern", Company: "IndiaCo"}}},
 	}
-	results := searchMasterIndex("python")
+	results := searchMasterIndex("python", false, false, false)
 	if len(results) < 2 {
 		t.Fatalf("expected results, got %d", len(results))
 	}

@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"sort"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -389,7 +391,7 @@ func GetLocationContext(loc string) (string, bool) {
 	return "Global", false
 }
 
-func searchMasterIndex(query string) []CompanyResponse {
+func searchMasterIndex(query string, remoteOnly, recentOnly, indiaOnly bool) []CompanyResponse {
 	q := strings.ToLower(query)
 	var results []CompanyResponse
 	start := time.Now()
@@ -404,23 +406,91 @@ func searchMasterIndex(query string) []CompanyResponse {
 	}
 
 	if q == "" {
-		if len(cache) > 1000 {
-			results = append(results, cache[:1000]...)
-		} else {
-			results = append(results, cache...)
+		var highPriority []CompanyResponse
+		var standard []CompanyResponse
+
+		for _, cr := range cache {
+			var matchedJobs []Job
+			hasNew := false
+			for _, j := range cr.Jobs {
+				if remoteOnly && !j.IsRemote {
+					continue
+				}
+				if recentOnly && !j.IsNew {
+					continue
+				}
+				if indiaOnly && !j.IsIndia {
+					continue
+				}
+				if j.IsNew {
+					hasNew = true
+				}
+				matchedJobs = append(matchedJobs, j)
+			}
+
+			if len(matchedJobs) > 0 {
+				sort.SliceStable(matchedJobs, func(i, j int) bool {
+					if matchedJobs[i].IsNew != matchedJobs[j].IsNew {
+						return matchedJobs[i].IsNew
+					}
+					return matchedJobs[i].IsIndia && !matchedJobs[j].IsIndia
+				})
+				crCopy := cr
+				crCopy.Jobs = matchedJobs
+
+				if crCopy.IsIndian && hasNew {
+					highPriority = append(highPriority, crCopy)
+				} else {
+					standard = append(standard, crCopy)
+				}
+			}
 		}
-		return results
+
+		r := rand.New(rand.NewSource(int64(time.Now().YearDay())))
+		r.Shuffle(len(highPriority), func(i, j int) { highPriority[i], highPriority[j] = highPriority[j], highPriority[i] })
+		r.Shuffle(len(standard), func(i, j int) { standard[i], standard[j] = standard[j], standard[i] })
+
+		var selected []CompanyResponse
+		hpCount := 20
+		if len(highPriority) < hpCount {
+			hpCount = len(highPriority)
+		}
+		selected = append(selected, highPriority[:hpCount]...)
+
+		remainingNeeded := 40 - len(selected)
+		if len(standard) < remainingNeeded {
+			remainingNeeded = len(standard)
+		}
+		selected = append(selected, standard[:remainingNeeded]...)
+
+		r.Shuffle(len(selected), func(i, j int) { selected[i], selected[j] = selected[j], selected[i] })
+		return selected
 	}
 
 	for _, cr := range cache {
 		var matchedJobs []Job
 		for _, j := range cr.Jobs {
+			if remoteOnly && !j.IsRemote {
+				continue
+			}
+			if recentOnly && !j.IsNew {
+				continue
+			}
+			if indiaOnly && !j.IsIndia {
+				continue
+			}
 			if jobMatchesRoleQuery(j.Title, j.Company, q) {
 				matchedJobs = append(matchedJobs, j)
 			}
 		}
 
 		if len(matchedJobs) > 0 {
+			sort.SliceStable(matchedJobs, func(i, j int) bool {
+				if matchedJobs[i].IsNew != matchedJobs[j].IsNew {
+					return matchedJobs[i].IsNew
+				}
+				return matchedJobs[i].IsIndia && !matchedJobs[j].IsIndia
+			})
 			crCopy := cr
 			crCopy.Jobs = matchedJobs
 			results = append(results, crCopy)
@@ -440,7 +510,7 @@ func searchMasterIndex(query string) []CompanyResponse {
 }
 
 // searchIndiaJobsFromRAM filters India roles exclusively from RAM cache.
-func searchIndiaJobsFromRAM(query string) []Job {
+func searchIndiaJobsFromRAM(query string, remoteOnly, recentOnly bool) []Job {
 	q := strings.ToLower(strings.TrimSpace(query))
 	var out []Job
 
@@ -452,11 +522,22 @@ func searchIndiaJobsFromRAM(query string) []Job {
 			if !j.IsIndia {
 				continue
 			}
+			if remoteOnly && !j.IsRemote {
+				continue
+			}
+			if recentOnly && !j.IsNew {
+				continue
+			}
 			if q == "" || jobMatchesRoleQuery(j.Title, j.Company, q) {
 				out = append(out, j)
 			}
 		}
 	}
+	
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].IsNew && !out[j].IsNew
+	})
+	
 	if len(out) > 1000 {
 		out = out[:1000]
 	}
@@ -506,10 +587,20 @@ func main() {
 		}
 		if os.Args[1] == "--ingest-seeds" {
 			deepHunt := false
-			if len(os.Args) > 2 && os.Args[2] == "--deep-hunt" {
-				deepHunt = true
+			indiaOnly := false
+			for _, arg := range os.Args[2:] {
+				if arg == "--deep-hunt" {
+					deepHunt = true
+				}
+				if arg == "--india-only" {
+					indiaOnly = true
+				}
 			}
-			IngestAllSeeds(deepHunt)
+			if indiaOnly {
+				IngestIndianSeeds()
+			} else {
+				IngestAllSeeds(deepHunt)
+			}
 			return
 		}
 		if os.Args[1] == "--build-index" {
@@ -597,16 +688,21 @@ func main() {
 
 	app.Get("/api/companies", func(c *fiber.Ctx) error {
 		query := strings.ToLower(strings.TrimSpace(c.Query("search", "")))
+		remoteOnly := c.Query("remoteOnly") == "true"
+		recentOnly := c.Query("recentOnly") == "true"
+		indiaOnly := c.Query("indiaOnly") == "true"
 
 		fmt.Printf("[API] Searching RAM Cache for: %s\n", query)
-		results := searchMasterIndex(query)
+		results := searchMasterIndex(query, remoteOnly, recentOnly, indiaOnly)
 		
-		if len(results) == 0 && len(query) > 2 {
+		if len(results) == 0 && len(query) >= 2 {
 			fmt.Printf("[API] 0 local results for '%s'. Running synchronous Serper hunt...\n", query)
 			TriggerRuntimeDiscovery(query)
-			results = searchMasterIndex(query)
-		} else if len(query) > 2 {
+			results = searchMasterIndex(query, remoteOnly, recentOnly, indiaOnly)
+			go TriggerLinkedInDiscovery(query) // secondary LinkedIn hunt runs in background
+		} else if len(query) >= 2 {
 			go TriggerRuntimeDiscovery(query)
+			go TriggerLinkedInDiscovery(query) // secondary LinkedIn hunt always fires
 		}
 		
 		go asyncEnrich(query)
@@ -623,6 +719,20 @@ func main() {
 		}
 		
 		return c.JSON(results)
+	})
+
+	// GET /api/discovery-stats — runtime discovery counters for the UI live badge.
+	app.Get("/api/discovery-stats", func(c *fiber.Ctx) error {
+		snap := GetRuntimeDiscoveryStats()
+		total := snap.SerperCompanies + snap.LinkedInVerified + snap.IndianVerified
+		return c.JSON(map[string]interface{}{
+			"totalRuntimeCompanies": total,
+			"serperCompanies":       snap.SerperCompanies,
+			"linkedInSlugsFound":    snap.LinkedInSlugs,
+			"linkedInVerified":      snap.LinkedInVerified,
+			"linkedInJobs":          snap.LinkedInJobs,
+			"indianVerified":        snap.IndianVerified,
+		})
 	})
 
 	app.Get("/api/company", func(c *fiber.Ctx) error {
@@ -674,6 +784,7 @@ func main() {
 			if count == 0 {
 				return c.Status(404).JSON(map[string]string{"error": "Company not found"})
 			}
+			return c.JSON(map[string]string{"status": "no_jobs"})
 		}
 
 		// Dynamic DetectOrigin for specific company view
@@ -755,9 +866,11 @@ func main() {
 
 	app.Get("/api/india-jobs", func(c *fiber.Ctx) error {
 		query := strings.ToLower(c.Query("query", ""))
+		remoteOnly := c.Query("remoteOnly") == "true"
+		recentOnly := c.Query("recentOnly") == "true"
 
 		fmt.Printf("[API] Searching RAM Cache (India only) for: %s\n", query)
-		finalResults := searchIndiaJobsFromRAM(query)
+		finalResults := searchIndiaJobsFromRAM(query, remoteOnly, recentOnly)
 
 		go asyncEnrich(query)
 		
@@ -778,6 +891,35 @@ func main() {
 		}
 		
 		return c.JSON(finalResults)
+	})
+
+	app.Post("/api/match-resume", func(c *fiber.Ctx) error {
+		fileHeader, err := c.FormFile("resume")
+		if err != nil {
+			return c.Status(400).JSON(map[string]interface{}{"error": "Failed to upload file", "code": 400})
+		}
+
+		if fileHeader.Size > 2*1024*1024 {
+			return c.Status(400).JSON(map[string]interface{}{"error": "File size exceeds 2MB limit", "code": 400})
+		}
+
+		file, err := fileHeader.Open()
+		if err != nil {
+			return c.Status(500).JSON(map[string]interface{}{"error": "Failed to process file", "code": 500})
+		}
+		defer file.Close()
+
+		text, err := ProcessResumeUpload(file)
+		if err != nil {
+			return c.Status(400).JSON(map[string]interface{}{"error": err.Error(), "code": 400})
+		}
+
+		remoteOnly := c.Query("remoteOnly") == "true"
+		recentOnly := c.Query("recentOnly") == "true"
+		indiaOnly := c.Query("indiaOnly") == "true"
+
+		results := FindCompaniesForResume(text, remoteOnly, recentOnly, indiaOnly)
+		return c.JSON(results)
 	})
 
 	port := os.Getenv("PORT")

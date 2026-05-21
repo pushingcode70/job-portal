@@ -650,6 +650,9 @@ func logStats() {
 	_ = DB.QueryRow(`SELECT count(*) FROM companies WHERE platform IN ('greenhouse','lever','smartrecruiters','ashby','zoho','darwinbox','workday')`).Scan(&verified)
 	_ = DB.QueryRow(`SELECT count(*) FROM jobs`).Scan(&dbJobs)
 
+	var indianVerified int
+	_ = DB.QueryRow(`SELECT count(*) FROM companies WHERE is_indian = 1 AND platform NOT IN ('pending', '', 'invalid')`).Scan(&indianVerified)
+
 	RAMCacheMutex.RLock()
 	ramJobs := 0
 	for _, cr := range RAMCache {
@@ -658,10 +661,19 @@ func logStats() {
 	RAMCacheMutex.RUnlock()
 
 	speed := float64(hunterStats.lastBatchPerSec.Load()) / 100.0
-	fmt.Printf(
-		"[STATS] Pending: %d | Verified: %d | Invalid: %d | Total Jobs: %d (RAM: %d)\n",
-		pending, verified, invalid, dbJobs, ramJobs,
-	)
+	
+	// Add total library size query
+	var totalLibrarySize int
+	_ = DB.QueryRow(`SELECT count(*) FROM companies`).Scan(&totalLibrarySize)
+
+	fmt.Printf("[TITAN] Library Size: %d | Verified Indian Boards: %d\n", totalLibrarySize, indianVerified)
+	
+	siKeyword, _ := CurrentStartupIndiaKeyword.Load().(string)
+	nasscomKeyword, _ := CurrentNasscomKeyword.Load().(string)
+	if siKeyword != "" || nasscomKeyword != "" {
+		fmt.Printf("[TITAN] Hunter Status: Scraping StartupIndia [%s] | NASSCOM [%s]\n", siKeyword, nasscomKeyword)
+	}
+
 	fmt.Printf("[SPEED] Current Rate: ~%.1f companies/sec\n", speed)
 }
 
@@ -778,7 +790,7 @@ var (
 
 func TriggerRuntimeDiscovery(query string) {
 	query = strings.TrimSpace(strings.ToLower(query))
-	if query == "" || len(query) <= 2 {
+	if query == "" || len(query) <= 1 {
 		return
 	}
 
@@ -881,7 +893,7 @@ func TriggerRuntimeDiscovery(query string) {
 					continue
 				}
 				fmt.Printf("[HUNTER] Discovered new company: %s (%s)\n", slug, platform)
-				
+				atomic.AddInt64(&runtimeSerperCompanies, 1) // increment live UI counter
 				SerperStatsMu.Lock()
 				SerperDiscoveredCompaniesCount++
 				SerperQueryCompanyCounts[query]++
@@ -933,4 +945,184 @@ func TriggerRuntimeDiscovery(query string) {
 		fmt.Println("[HUNTER] New jobs ingested. Refreshing RAM cache.")
 		RefreshRAMCache()
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Runtime Discovery Stats — tracks companies found by Serper + LinkedIn hunts.
+// These are incremented atomically so they're safe under concurrent searches.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var (
+	runtimeSerperCompanies  int64 // companies found via existing Serper ATS hunt
+	runtimeLinkedInSlugs    int64 // slugs extracted from LinkedIn via Google dork
+	runtimeLinkedInVerified int64 // slugs that matched an ATS board
+	runtimeLinkedInJobs     int64 // jobs ingested from LinkedIn-discovered companies
+	linkedInThrottle        sync.Map
+)
+
+// RuntimeDiscoverySnapshot returns a snapshot of runtime discovery stats.
+type RuntimeDiscoverySnapshot struct {
+	SerperCompanies  int64 `json:"serperCompanies"`
+	LinkedInSlugs    int64 `json:"linkedInSlugs"`
+	LinkedInVerified int64 `json:"linkedInVerified"`
+	LinkedInJobs     int64 `json:"linkedInJobs"`
+	IndianVerified   int64 `json:"indianVerified"`
+}
+
+func GetRuntimeDiscoveryStats() RuntimeDiscoverySnapshot {
+	var indianVerified int64
+	if DB != nil {
+		DB.QueryRow("SELECT count(*) FROM companies WHERE is_indian = 1").Scan(&indianVerified)
+	}
+	return RuntimeDiscoverySnapshot{
+		SerperCompanies:  atomic.LoadInt64(&runtimeSerperCompanies),
+		LinkedInSlugs:    atomic.LoadInt64(&runtimeLinkedInSlugs),
+		LinkedInVerified: atomic.LoadInt64(&runtimeLinkedInVerified),
+		LinkedInJobs:     atomic.LoadInt64(&runtimeLinkedInJobs),
+		IndianVerified:   indianVerified,
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TriggerLinkedInDiscovery — secondary pipeline that uses Google Dorks to
+// extract company slugs from LinkedIn, then probes their ATS boards.
+// It never touches LinkedIn servers directly; it only reads Google's index.
+// This runs entirely in the background and is fully isolated from the original
+// Serper ATS hunt logic.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TriggerLinkedInDiscovery(query string) {
+	query = strings.TrimSpace(strings.ToLower(query))
+	if query == "" || len(query) <= 1 {
+		return
+	}
+
+	// Throttle: don't re-query the same term within 2 hours
+	if v, loaded := linkedInThrottle.Load(query); loaded {
+		if time.Since(v.(time.Time)) < 2*time.Hour {
+			return
+		}
+	}
+	linkedInThrottle.Store(query, time.Now())
+
+	serperKey := os.Getenv("SERPER_API_KEY")
+	if serperKey == "" {
+		return
+	}
+
+	// Google dork: finds LinkedIn company profile pages mentioning the query.
+	// We ask for 20 results to maximise slug yield per credit spent.
+	dork := fmt.Sprintf(`site:linkedin.com/company "%s"`, query)
+	payload := fmt.Sprintf(`{"q":%q,"num":20}`, dork)
+
+	req, err := http.NewRequest("POST", "https://google.serper.dev/search", strings.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-API-KEY", serperKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Organic []struct {
+			Link string `json:"link"`
+		} `json:"organic"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return
+	}
+
+	// Extract unique slugs from LinkedIn company URLs.
+	// e.g. https://www.linkedin.com/company/aircall/ → "aircall"
+	seen := make(map[string]struct{})
+	var slugs []string
+	for _, item := range data.Organic {
+		link := item.Link
+		if !strings.Contains(link, "linkedin.com/company/") {
+			continue
+		}
+		parts := strings.Split(strings.Split(link, "linkedin.com/company/")[1], "/")
+		slug := strings.ToLower(strings.TrimSpace(parts[0]))
+		if slug == "" || slug == "jobs" || slug == "search" {
+			continue
+		}
+		// Strip query strings
+		slug = strings.Split(slug, "?")[0]
+		if _, dup := seen[slug]; dup {
+			continue
+		}
+		seen[slug] = struct{}{}
+		slugs = append(slugs, slug)
+	}
+
+	if len(slugs) == 0 {
+		return
+	}
+
+	atomic.AddInt64(&runtimeLinkedInSlugs, int64(len(slugs)))
+	fmt.Printf("[LINKEDIN] Extracted %d slugs for query '%s'\n", len(slugs), query)
+
+	// Filter to only slugs not already in our DB to avoid redundant probing.
+	if DB == nil {
+		return
+	}
+	var newSlugs []string
+	for _, slug := range slugs {
+		var count int
+		if err := DB.QueryRow("SELECT COUNT(*) FROM companies WHERE slug = ?", slug).Scan(&count); err == nil && count == 0 {
+			newSlugs = append(newSlugs, slug)
+		}
+	}
+
+	if len(newSlugs) == 0 {
+		fmt.Printf("[LINKEDIN] All %d slugs already known. Skipping.\n", len(slugs))
+		return
+	}
+
+	// Insert new slugs as 'pending' so the background Hunter picks them up.
+	for _, slug := range newSlugs {
+		_, _ = DB.Exec(
+			`INSERT OR IGNORE INTO companies (slug, name, platform, is_indian, last_checked) VALUES (?, ?, 'pending', 0, ?)`,
+			slug, slug, time.Now(),
+		)
+	}
+	fmt.Printf("[LINKEDIN] Queued %d new slugs for ATS probing\n", len(newSlugs))
+
+	// Immediately probe in a small goroutine so results appear faster.
+	go func(toProbe []string) {
+		if hunterHTTPClient == nil {
+			return
+		}
+		results := make([]hunterResult, len(toProbe))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 10) // cap at 10 concurrent probes
+		for i, slug := range toProbe {
+			i, slug := i, slug
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				results[i] = probeHunterSlug(hunterHTTPClient, slug)
+			}()
+		}
+		wg.Wait()
+
+		// Count verified
+		var verified int64
+		for _, r := range results {
+			if r.platform != "" {
+				verified++
+			}
+		}
+		atomic.AddInt64(&runtimeLinkedInVerified, verified)
+		flushHunterResults(results)
+		fmt.Printf("[LINKEDIN] Probing complete: %d/%d matched an ATS board\n", verified, len(toProbe))
+	}(newSlugs)
 }

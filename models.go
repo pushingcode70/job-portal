@@ -10,13 +10,16 @@ type Job struct {
 	LocationTag string `json:"locationTag"`
 	URL         string `json:"url"`
 	IsIndia     bool   `json:"isIndia"`
+	IsNew       bool   `json:"isNew,omitempty"`
+	IsRemote    bool   `json:"isRemote,omitempty"`
 }
 
-// CompanyResponse represents the API response for /api/company
 type CompanyResponse struct {
-	Name      string `json:"name"`
-	IsIndian  bool   `json:"isIndian"`
-	Jobs      []Job  `json:"jobs"`
+	Name            string   `json:"name"`
+	IsIndian        bool     `json:"isIndian"`
+	Jobs            []Job    `json:"jobs"`
+	ConfidenceScore int      `json:"confidenceScore,omitempty"`
+	MatchedSkills   []string `json:"matchedSkills,omitempty"`
 }
 
 // MasterIndex represents the full job cache
