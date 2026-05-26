@@ -410,6 +410,9 @@ func searchMasterIndex(query string, remoteOnly, recentOnly, indiaOnly bool) []C
 		var standard []CompanyResponse
 
 		for _, cr := range cache {
+			if len(cr.Jobs) == 0 {
+				continue
+			}
 			var matchedJobs []Job
 			hasNew := false
 			for _, j := range cr.Jobs {
@@ -436,6 +439,15 @@ func searchMasterIndex(query string, remoteOnly, recentOnly, indiaOnly bool) []C
 					return matchedJobs[i].IsIndia && !matchedJobs[j].IsIndia
 				})
 				crCopy := cr
+				
+				hasIndiaJob := false
+				for _, j := range matchedJobs {
+					if j.IsIndia {
+						hasIndiaJob = true
+						break
+					}
+				}
+				crCopy.IsIndian = hasIndiaJob
 				crCopy.Jobs = matchedJobs
 
 				if crCopy.IsIndian && hasNew {
@@ -468,6 +480,9 @@ func searchMasterIndex(query string, remoteOnly, recentOnly, indiaOnly bool) []C
 	}
 
 	for _, cr := range cache {
+		if len(cr.Jobs) == 0 {
+			continue
+		}
 		var matchedJobs []Job
 		for _, j := range cr.Jobs {
 			if remoteOnly && !j.IsRemote {
@@ -492,6 +507,15 @@ func searchMasterIndex(query string, remoteOnly, recentOnly, indiaOnly bool) []C
 				return matchedJobs[i].IsIndia && !matchedJobs[j].IsIndia
 			})
 			crCopy := cr
+			
+			hasIndiaJob := false
+			for _, j := range matchedJobs {
+				if j.IsIndia {
+					hasIndiaJob = true
+					break
+				}
+			}
+			crCopy.IsIndian = hasIndiaJob
 			crCopy.Jobs = matchedJobs
 			results = append(results, crCopy)
 		}
@@ -588,23 +612,44 @@ func main() {
 		if os.Args[1] == "--ingest-seeds" {
 			deepHunt := false
 			indiaOnly := false
+			startupIndia := false
 			for _, arg := range os.Args[2:] {
-				if arg == "--deep-hunt" {
+				switch arg {
+				case "--deep-hunt":
 					deepHunt = true
-				}
-				if arg == "--india-only" {
+				case "--india-only":
 					indiaOnly = true
+				case "--startup-india":
+					startupIndia = true
 				}
 			}
-			if indiaOnly {
+			if startupIndia {
+				IngestStartupIndia()
+			} else if indiaOnly {
 				IngestIndianSeeds()
 			} else {
 				IngestAllSeeds(deepHunt)
 			}
 			return
 		}
+		if os.Args[1] == "--startup-india" {
+			IngestStartupIndia()
+			return
+		}
+		if os.Args[1] == "--ingest-indiaai" {
+			IngestIndiaAI()
+			return
+		}
 		if os.Args[1] == "--build-index" {
 			syncJobsToDB()
+			return
+		}
+		if os.Args[1] == "--manual-ingest" {
+			IngestManualList()
+			return
+		}
+		if os.Args[1] == "--deep-dive" {
+			IngestDeepDive()
 			return
 		}
 		if os.Args[1] == "--reset-smartrecruiters" {

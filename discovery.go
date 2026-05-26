@@ -31,7 +31,7 @@ const (
 	hunterChromeUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
 )
 
-var platformProbePriority = []string{"greenhouse", "lever", "ashby", "smartrecruiters"}
+var platformProbePriority = []string{"greenhouse", "lever", "ashby", "smartrecruiters", "freshteam", "zohorecruit", "bamboohr", "recruitee", "workable"}
 
 // HTTPDoer is used by the hunter (mockable in tests).
 type HTTPDoer interface {
@@ -320,6 +320,71 @@ func verifySmartRecruitersBody(body []byte) bool {
 	return data.TotalFound > 0
 }
 
+// verifyFreshteamBody checks for a valid Freshteam career page with job listings.
+func verifyFreshteamBody(body []byte) bool {
+	if !boardBodyLargeEnough(body) {
+		return false
+	}
+	// Freshteam pages contain job listing HTML; check for key markers
+	s := string(body)
+	return strings.Contains(s, "job-title") || strings.Contains(s, "job-listing") || strings.Contains(s, "fkit-job")
+}
+
+// verifyZohoRecruitBody checks for a valid Zoho Recruit career page.
+func verifyZohoRecruitBody(body []byte) bool {
+	if !boardBodyLargeEnough(body) {
+		return false
+	}
+	s := string(body)
+	return strings.Contains(s, "job-opening") || strings.Contains(s, "careers-job") || strings.Contains(s, "jobOpening")
+}
+
+// verifyBambooHRBody checks for a valid BambooHR career page.
+func verifyBambooHRBody(body []byte) bool {
+	if !boardBodyLargeEnough(body) {
+		return false
+	}
+	var data struct {
+		Result []json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		// Fallback: check HTML markers
+		s := string(body)
+		return strings.Contains(s, "ResumatorJob") || strings.Contains(s, "BambooHR-ATS-board")
+	}
+	return len(data.Result) > 0
+}
+
+// verifyRecruiteeBody checks for a valid Recruitee career page.
+func verifyRecruiteeBody(body []byte) bool {
+	if !boardBodyLargeEnough(body) {
+		return false
+	}
+	var data struct {
+		Offers []json.RawMessage `json:"offers"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		s := string(body)
+		return strings.Contains(s, "offer-title") || strings.Contains(s, "recruitee")
+	}
+	return len(data.Offers) > 0
+}
+
+// verifyWorkableBody checks for a valid Workable career page.
+func verifyWorkableBody(body []byte) bool {
+	if !boardBodyLargeEnough(body) {
+		return false
+	}
+	var data struct {
+		Results []json.RawMessage `json:"results"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		s := string(body)
+		return strings.Contains(s, "job-listing") || strings.Contains(s, "workable")
+	}
+	return len(data.Results) > 0
+}
+
 func hunterRequestJitter() {
 	ms := hunterJitterMinMS + hunterRand.Intn(hunterJitterMaxMS-hunterJitterMinMS+1)
 	time.Sleep(time.Duration(ms) * time.Millisecond)
@@ -425,6 +490,36 @@ func probesForSlug(slug string) []atsProbe {
 			host:     "api.smartrecruiters.com",
 			url:      fmt.Sprintf("https://api.smartrecruiters.com/v1/companies/%s/postings", slug),
 			verify:   verifySmartRecruitersBody,
+		},
+		{
+			platform: "freshteam",
+			host:     slug + ".freshteam.com",
+			url:      fmt.Sprintf("https://%s.freshteam.com/jobs", slug),
+			verify:   verifyFreshteamBody,
+		},
+		{
+			platform: "zohorecruit",
+			host:     slug + ".zohorecruit.com",
+			url:      fmt.Sprintf("https://%s.zohorecruit.com/jobs", slug),
+			verify:   verifyZohoRecruitBody,
+		},
+		{
+			platform: "bamboohr",
+			host:     slug + ".bamboohr.com",
+			url:      fmt.Sprintf("https://%s.bamboohr.com/careers", slug),
+			verify:   verifyBambooHRBody,
+		},
+		{
+			platform: "recruitee",
+			host:     slug + ".recruitee.com",
+			url:      fmt.Sprintf("https://%s.recruitee.com/api/offers", slug),
+			verify:   verifyRecruiteeBody,
+		},
+		{
+			platform: "workable",
+			host:     "apply.workable.com",
+			url:      fmt.Sprintf("https://apply.workable.com/api/v1/widget/accounts/%s", slug),
+			verify:   verifyWorkableBody,
 		},
 	}
 }

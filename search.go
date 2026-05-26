@@ -209,11 +209,17 @@ func jobMatchesTerms(title, company string, terms []string) bool {
 }
 
 // jobMatchesRoleQuery is the strict matcher used by search.
-func jobMatchesRoleQuery(title, _ string, query string) bool {
+func jobMatchesRoleQuery(title, company string, query string) bool {
 	plan := buildSearchPlan(query)
 	if plan.rawQuery == "" {
 		return true
 	}
+
+	cLower := strings.ToLower(company)
+	if cLower == plan.rawQuery || strings.HasPrefix(cLower, plan.rawQuery+" ") || strings.Contains(cLower, " "+plan.rawQuery) || strings.HasPrefix(cLower, plan.rawQuery+"-") {
+		return true
+	}
+
 
 	for _, group := range plan.skillGroups {
 		if !titleMatchesAny(title, group) {

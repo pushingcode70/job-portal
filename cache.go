@@ -43,13 +43,10 @@ func refreshRAMCacheFromQuery(limitClause string) {
 	fmt.Println("[CACHE] Refreshing global RAM cache...")
 	start := time.Now()
 
-	indianSlugs := loadIndianCompanySlugs()
-
 	sqlStmt := `
-		SELECT j.title, j.company, COALESCE(j.location, ''), COALESCE(j.location_tag, ''), j.url, 
-		       (COALESCE(j.is_india, 0) OR COALESCE(c.is_indian, 0)) AS is_india, j.timestamp
-		FROM jobs j
-		LEFT JOIN companies c ON LOWER(j.company) = c.slug`
+		SELECT title, company, COALESCE(location, ''), COALESCE(location_tag, ''), url, 
+		       COALESCE(is_india, 0) AS is_india, timestamp
+		FROM jobs`
 	if limitClause != "" {
 		sqlStmt += " " + limitClause
 	}
@@ -101,14 +98,11 @@ func refreshRAMCacheFromQuery(limitClause string) {
 		if _, exists := companyMap[key]; !exists {
 			companyMap[key] = &CompanyResponse{
 				Name:     companyDisplayName(companySlug),
-				IsIndian: indianSlugs[key],
+				IsIndian: false,
 				Jobs:     []Job{},
 			}
 		}
 		data := companyMap[key]
-		if jobIndian {
-			data.IsIndian = true
-		}
 		display := companyDisplayName(companySlug)
 		data.Jobs = append(data.Jobs, Job{
 			Title:       jobTitle,
@@ -153,6 +147,15 @@ func buildSortedCompanyList(companyMap map[string]*CompanyResponse) []CompanyRes
 	var results []CompanyResponse
 	for _, cr := range companyMap {
 		if len(cr.Jobs) > 0 {
+			hasIndiaJob := false
+			for _, j := range cr.Jobs {
+				if j.IsIndia {
+					hasIndiaJob = true
+					break
+				}
+			}
+			cr.IsIndian = hasIndiaJob
+
 			sort.Slice(cr.Jobs, func(i, j int) bool {
 				return cr.Jobs[i].IsIndia && !cr.Jobs[j].IsIndia
 			})
@@ -169,6 +172,14 @@ func sortCompaniesByJobCount(results []CompanyResponse) {
 		if results[i].IsIndian != results[j].IsIndian {
 			return results[i].IsIndian
 		}
+		
+		if results[i].IsIndian {
+			cI, cJ := 0, 0
+			for _, job := range results[i].Jobs { if job.IsIndia { cI++ } }
+			for _, job := range results[j].Jobs { if job.IsIndia { cJ++ } }
+			if cI != cJ { return cI > cJ }
+		}
+		
 		ni, nj := len(results[i].Jobs), len(results[j].Jobs)
 		if ni != nj {
 			return ni > nj
