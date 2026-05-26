@@ -36,3 +36,4 @@ frontend/_next/
 
 # duplicate redesign folder
 job-portal-redesign(2)/*.csv
+jobs.db
